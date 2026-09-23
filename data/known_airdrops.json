@@ -1,0 +1,47 @@
+{
+  "airdrops": [
+    {
+      "symbol": "UNI",
+      "chain": "ethereum",
+      "claim_contract": null,
+      "distribution_date": "2020-09-16",
+      "notes": "Also a tracked DeFi token \u2014 separate airdropped from purchased balances"
+    },
+    {
+      "symbol": "ARB",
+      "chain": "arbitrum",
+      "claim_contract": null,
+      "distribution_date": "2023-03-23",
+      "notes": "Claim on Arbitrum; track post-bridge activity on Ethereum only (ADR 0001 exception)"
+    },
+    {
+      "symbol": "ENA",
+      "chain": "ethereum",
+      "claim_contract": null,
+      "distribution_date": "2024-04-02",
+      "notes": null
+    },
+    {
+      "symbol": "EIGEN",
+      "chain": "ethereum",
+      "claim_contract": null,
+      "distribution_date": "2024-05-10",
+      "notes": "Claims opened 2024-05-10. Transferability was enabled later on 2024-10-01. We track the claim date because that's when zero-cost-basis balances enter wallets, which is what airdrop-aware PnL needs."
+    },
+    {
+      "symbol": "MORPHO",
+      "chain": "ethereum",
+      "claim_contract": null,
+      "distribution_date": "2024-11-21",
+      "notes": "Also a tracked DeFi token; check if any distribution happened on Base in Week 3"
+    },
+    {
+      "symbol": "ETHFI",
+      "chain": "ethereum",
+      "claim_contract": null,
+      "distribution_date": "2024-03-18",
+      "notes": null
+    }
+  ],
+  "notes": "V1 airdrop registry. See docs/decisions/0001-airdrop-selection.md for selection reasoning. Claim contract addresses to be filled in during Week 3 verification."
+}

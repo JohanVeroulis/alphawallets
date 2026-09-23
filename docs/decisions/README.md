@@ -21,3 +21,4 @@ This folder records significant decisions: what we chose, why, and what we gave 
 | # | Title | Status |
 |---|---|---|
 | [0001](0001-airdrop-selection.md) | V1 Airdrop Selection | Accepted |
+| [0002](0002-pandas-2x-pin.md) | Pin pandas to 2.x for V1 | Accepted |
