@@ -252,3 +252,6 @@ data/processed/*
 
 # Ruff cache
 .ruff_cache/
+
+# Throwaway test scripts
+scripts/
