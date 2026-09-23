@@ -216,3 +216,39 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- AlphaWallets specific ----
+
+# Local data cache (contents ignored, structure preserved via .gitkeep and READMEs)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/**/README.md
+
+# DuckDB local databases
+*.duckdb
+*.duckdb.wal
+
+# Environment
+.env
+.env.local
+.env.*.local
+# Keep .env.example
+!.env.example
+
+# uv lockfile — commit this so builds are reproducible
+# (uv.lock explicitly NOT in .gitignore — we DO commit it)
+
+# IDE / OS
+.DS_Store
+.vscode/settings.json
+.vscode/launch.json
+.idea/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# Ruff cache
+.ruff_cache/
