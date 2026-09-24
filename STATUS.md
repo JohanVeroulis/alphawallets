@@ -1,15 +1,17 @@
 # Status
 
-**Last updated:** 2026-09-23
+**Last updated:** 2026-09-24
 
 A 30-second answer to "where are we right now?". Update it at the end of each work session, or weekly at minimum. Keep the older entries short; this file is a snapshot, not a log.
 
 ## Current focus
 
-Week 1 kickoff: setting up the Dune workspace, storing `DUNE_API_KEY` locally, and writing the first wallet universe query (AW_01).
+Week 1 kickoff on the Alchemy path: setting up the first fetchers against Ethereum + Base, and investigating a free historical price source (DefiLlama primary candidate, per [ADR 0003](docs/decisions/0003-alchemy-over-dune.md)).
 
 ## Recent activity
 
+- **2026-09-23** — PR #5 merged: [ADR 0003](docs/decisions/0003-alchemy-over-dune.md) records the switch from Dune to Alchemy as V1 data source. Dune Free went view-only in 2026; Analyst plan ($75/mo) not viable pre-revenue. Alchemy free tier (300M CUs/month) selected as sole V1 source.
+- **2026-09-23** — Alchemy account created; one API key enabled for Ethereum Mainnet, Base Mainnet, Arbitrum Mainnet. End-to-end connectivity verified from Python across all 3 chains (live block heights returned).
 - **2026-09-23** — PR #3 merged: complete project scaffolding — README, ROADMAP, STATUS, folder structure (`queries/`, `src/`, `tests/`, `notebooks/`, `data/`, `.github/ISSUE_TEMPLATE/`), Python packaging with uv, and [ADR 0002 — Pin pandas to 2.x for V1](docs/decisions/0002-pandas-2x-pin.md)
 - **2026-09-23** — Python tooling installed and verified: uv 0.12.18, ruff, pytest all pass on the empty codebase
 - **2026-09-23** — Airdrop registry created (`data/known_airdrops.json`) with 6 V1 airdrops; EIGEN date corrected to 2024-05-10 (claim opening)
@@ -21,9 +23,9 @@ Week 1 kickoff: setting up the Dune workspace, storing `DUNE_API_KEY` locally, a
 
 ## Next up
 
-1. Create the Dune Analytics account (if not already), generate an API key, store it in a local `.env`
-2. Verify Dune plan limits (queries/day, credits) and record the findings
-3. Write `AW_01_wallet_universe`: candidate wallets on Ethereum + Base, filtered per CLAUDE.md Section 9 provisional rules
+1. PR #6: architectural rewrite for the Alchemy path — CLAUDE.md scope, ROADMAP, `queries/` → `src/alphawallets/fetchers/`, ADR 0004 (DuckDB as cache), remove `dune-client`
+2. First fetcher: fetch recent large swaps from Uniswap V3 on Ethereum + Base, store to the DuckDB cache, verify the data shape
+3. Historical price source investigation: test DefiLlama free API coverage for the 6 V1 airdrop tokens + 10 major DeFi tokens
 
 ## Open blockers
 

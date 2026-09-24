@@ -6,10 +6,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Ioannis Veroulis", email = "john.veroulis@gmail.com" }]
-keywords = ["ethereum", "base", "on-chain", "analytics", "dune", "defi"]
+keywords = ["ethereum", "base", "on-chain", "analytics", "alchemy", "defi"]
 
 dependencies = [
-    "dune-client>=1.7",
     "duckdb>=1.1",
     "pandas>=2.2,<3",
     "python-dotenv>=1.0",
