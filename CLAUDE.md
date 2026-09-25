@@ -104,7 +104,8 @@ uv run ruff format .    # format
 
 Every fetcher pulls raw data from Alchemy, decodes what it needs, and writes to DuckDB. The concrete patterns below are provisional — the first fetcher (Week 1) will refine them, and this section is updated as part of that PR.
 
-- Location: `src/alphawallets/fetchers/<protocol_or_domain>/<AW_XX_description>.py` where `<protocol_or_domain>` is a protocol (`uniswap_v3/`, `aave/`) or a generic data type (`erc20/`, `native_transfers/`). The current placeholder subfolders (`00_exploration/` through `05_wallet_detail/`) are Dune-pipeline stage names inherited from PR #7's rename and will be replaced with protocol domains in PR #10 when the fetcher READMEs are rewritten.
+- Location: `src/alphawallets/fetchers/<protocol_or_domain>/<AW_XX_description>.py` where `<protocol_or_domain>` is a protocol (`uniswap_v3/`, `aave/`) or a generic data type (`erc20/`). V1 Week 1 starts with `uniswap_v3/` and `erc20/`; new protocols land as their own subfolders when needed.
+- Derived analysis lives in a sibling `src/alphawallets/pipeline/` package, organized by stage (`exploration/`, `pnl/`, `categorization/`, `ranking/`). Pipeline stages read from DuckDB and never call Alchemy directly.
 - Fetcher module naming: `AW_XX_description.py` where `XX` is a zero-padded sequential number, never reused (`AW_01_uniswap_v3_swaps.py`)
 - Each fetcher module exposes a single entry point (function or class) that takes explicit inputs (chain, block range, target DuckDB path) and returns a summary of what was written — no hidden globals, no reading config from module scope
 - Block-range windowing pattern: **TBD Week 1** — the first fetcher establishes how we page through `eth_getLogs` while staying under Alchemy's response-size limits

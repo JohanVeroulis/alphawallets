@@ -6,10 +6,13 @@ A 30-second answer to "where are we right now?". Update it at the end of each wo
 
 ## Current focus
 
-Week 1 kickoff on the Alchemy path: setting up the first fetchers against Ethereum + Base, and investigating a free historical price source (DefiLlama primary candidate, per [ADR 0003](docs/decisions/0003-alchemy-over-dune.md)).
+Wrapping up PR #10 — the final rewrite PR for the Alchemy path. CLAUDE.md, ROADMAP, root README, `src/alphawallets/README`, and the fetcher/pipeline READMEs all now describe the Alchemy path with DuckDB as cache. Repo is ready for Week 1 fetcher work.
 
 ## Recent activity
 
+- **2026-09-25** — PR #10 in progress: architectural rewrite for the Alchemy path. Deleted the six Dune-era stage folders under `src/alphawallets/fetchers/`. Created protocol-based `fetchers/uniswap_v3/` and `fetchers/erc20/`. Created sibling `src/alphawallets/pipeline/` package with `exploration/`, `pnl/`, `categorization/`, `ranking/` stages. Rewrote ROADMAP.md as an 8-week Alchemy plan with a locked V1 scope. Rewrote root README.md and `src/alphawallets/README.md`.
+- **2026-09-25** — PR #9 merged: CLAUDE.md rewritten end-to-end for the Alchemy path. Section 3 (tech stack), 4 (timeline), 6 (conventions including new Fetchers subsection), 8, and 9 all updated. Non-goals expanded (NFTs excluded from V1). B+C engineering standards (type hints as contract, Pydantic for structured data) now explicit.
+- **2026-09-25** — PR #8 merged: [ADR 0004](docs/decisions/0004-duckdb-cache.md) records DuckDB as V1 local cache and analytical store. STATUS "Next up" refreshed after realizing it listed already-finished work.
 - **2026-09-24** — PR #6 merged: mechanical files cleaned of Dune references (`.env.example`, `pyproject.toml`, `uv.lock`, `STATUS.md`). PR #7 merged: `queries/` relocated to `src/alphawallets/fetchers/` (pure move, 7 renames at 100% similarity).
 - **2026-09-23** — PR #5 merged: [ADR 0003](docs/decisions/0003-alchemy-over-dune.md) records the switch from Dune to Alchemy as V1 data source. Dune Free went view-only in 2026; Analyst plan ($75/mo) not viable pre-revenue. Alchemy free tier (300M CUs/month) selected as sole V1 source.
 - **2026-09-23** — Alchemy account created; one API key enabled for Ethereum Mainnet, Base Mainnet, Arbitrum Mainnet. End-to-end connectivity verified from Python across all 3 chains (live block heights returned).
@@ -24,10 +27,10 @@ Week 1 kickoff on the Alchemy path: setting up the first fetchers against Ethere
 
 ## Next up
 
-1. PR #9: rewrite CLAUDE.md for the Alchemy path — scope, conventions, open questions
-2. PR #10: rewrite ROADMAP.md (indexing-layer budget) and the six fetcher READMEs; fix the project tree in README.md and `src/alphawallets/README.md`
-3. First fetcher: recent large Uniswap V3 swaps on Ethereum + Base → DuckDB cache, verify the data shape
-4. Historical price source investigation: DefiLlama free API coverage for the 6 V1 airdrop tokens + 10 major DeFi tokens
+1. Merge PR #10 (this in-progress work)
+2. First fetcher (Week 1): `AW_01_uniswap_v3_swaps.py` — pull Swap events from top V3 pools on Ethereum + Base, decode, write to DuckDB. Establish block-range windowing, ABI storage, raw vs decoded table naming conventions in the process.
+3. First fetcher (Week 1): `AW_02_erc20_transfers.py` — Transfers API for tracked DeFi tokens and airdrop distributions.
+4. Historical price source investigation: test DefiLlama free API coverage for the 6 V1 airdrop tokens + 10 major DeFi tokens.
 
 ## Open blockers
 
