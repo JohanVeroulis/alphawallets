@@ -1,25 +1,38 @@
 # alphawallets (Python package)
 
-The data pipeline: it pulls results from Dune, caches them locally in DuckDB, computes PnL, assigns categories, and writes the leaderboard the frontend reads.
+The Python side of AlphaWallets. Fetches on-chain data from Alchemy, indexes it in DuckDB, and computes per-wallet PnL, categories, and rankings.
 
-Empty for now apart from `__init__.py`. Modules arrive from Week 1 onward, as the queries they depend on stabilize.
+The V1 scope, conventions, and open questions are in [`CLAUDE.md`](../../CLAUDE.md). Week-by-week plan in [`ROADMAP.md`](../../ROADMAP.md).
 
-## What belongs here
+## Subpackages
 
-Planned modules:
+- [`fetchers/`](fetchers/README.md) — Raw data collection from Alchemy, organized by protocol or generic data type (`uniswap_v3/`, `erc20/`). Every fetcher writes to DuckDB and returns a summary of what it wrote.
+- [`pipeline/`](pipeline/README.md) — Derived analysis over the data written by fetchers. Reads from DuckDB, never calls Alchemy directly. Stages: `exploration/`, `pnl/`, `categorization/`, `ranking/`.
 
-| Module | Purpose | Arrives |
-|---|---|---|
-| `config.py` | Settings and secrets loaded from the environment | Week 1 |
-| `dune_client.py` | Dune API access with DuckDB caching of results | Week 1 |
-| `airdrops.py` | The V1 airdrop registry and claim attribution | Week 2 |
-| `pnl.py` | Realized PnL, FIFO cost basis, airdrop-aware split | Week 2 |
-| `categorization.py` | Traders / DeFi / Airdrop Hunters / Yield Farmers | Week 3 |
+## Top-level modules
+
+To be added with the first fetcher (Week 1). Expected:
+
+- Configuration and environment loading (Alchemy API key, DuckDB path, chain list)
+- A shared Alchemy client wrapper with retry, rate-limit awareness, and CU accounting
+- A known-airdrops registry (`data/known_airdrops.json`)
+
+Naming and structure are finalized as part of the first fetcher PR.
 
 ## Conventions
 
-- `snake_case.py` module names, PEP 8, type hints everywhere (CLAUDE.md Section 6)
-- Every public function has a docstring with at least one usage example
-- Secrets come from the environment, never from source — `config.py` is the only module that reads them
-- Business logic stays out of `dune_client.py`: it fetches and caches, nothing more
-- Each module gets a matching test file under [../../tests/](../../tests/)
+See [`CLAUDE.md`](../../CLAUDE.md) Section 6 for the full set. Highlights:
+
+- Type hints on everything, Pydantic models for data crossing module boundaries
+- Fetcher modules follow the `AW_XX_description.py` naming pattern
+- Fetchers never write outside their DuckDB tables; pipeline stages never call Alchemy
+
+## Tests
+
+`pytest` runs from the repo root:
+
+```bash
+uv run pytest
+```
+
+Tests live in `../../tests/`. Coverage targets grow as modules land — no strict floor while the package is only skeletons.

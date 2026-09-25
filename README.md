@@ -1,107 +1,116 @@
 # AlphaWallets
 
-**Find the wallets that are actually making money on-chain — and see what they're doing right now.**
+An on-chain analytics tool that identifies consistently profitable wallets on Ethereum and Base, sorts them into four categories (Traders, DeFi users, Airdrop Hunters, Yield Farmers), and shows what they are doing right now — so retail traders can learn from real profitable actors rather than from influencers.
 
-`Status: private · work in progress · targeting V1` · [Roadmap](ROADMAP.md) · [Current status](STATUS.md)
+> **Status:** V1 in progress. See [STATUS.md](STATUS.md) for the current state and [ROADMAP.md](ROADMAP.md) for the ~8-week plan.
 
-## What is AlphaWallets?
+## What this is
 
-AlphaWallets is an on-chain analytics tool that identifies consistently profitable wallets on Ethereum and Base. It ranks them by airdrop-aware PnL, sorts them into four behavioural categories, and shows their recent activity.
-
-The point is to replace "influencer said so" with evidence: real wallets, real positions, real results, straight from on-chain data.
-
-## Who it's for
-
-- **Retail crypto traders** who want to see what profitable wallets are doing instead of following calls on social media
-- **DeFi users** learning to read on-chain data, who want a worked example of wallet analytics
-- **Anyone studying on-chain behaviour**: which strategies actually produce returns over 30 and 90 days
+A read-only analytics engine over on-chain data. It ranks wallets by realized PnL, tags them by activity pattern, and separates trading returns from airdrop windfalls. The V1 scope is deliberately narrow — locked in [CLAUDE.md](CLAUDE.md) Section 2 — so it can actually ship.
 
 ## V1 scope
 
-| | |
-|---|---|
-| **Chains** | Ethereum mainnet, Base |
-| **Categories** | Traders, DeFi users, Airdrop Hunters, Yield Farmers |
-| **PnL** | Realized, FIFO cost basis, airdrop-aware (airdrop income kept separate) |
-| **Timeframes** | 30d, 90d |
-| **Features** | Leaderboard, wallet detail pages, filters (timeframe, category, trade size, min activity) |
+Full details in [CLAUDE.md](CLAUDE.md) Section 2 (locked scope).
 
-Tracked assets: ETH/USDC, ETH/USDT, WBTC/USDC, WBTC/ETH; UNI, AAVE, LDO, PENDLE, CRV, ENA, MKR, MORPHO, LINK, ARB; stablecoin activity in Aave, Compound, Morpho and Pendle. Six airdrops are tracked separately (UNI, ARB, ENA, EIGEN, MORPHO, ETHFI) — see [ADR 0001](docs/decisions/0001-airdrop-selection.md).
+- **Chains:** Ethereum mainnet, Base
+- **Categories:** Traders, DeFi users, Airdrop Hunters, Yield Farmers
+- **Tracked pairs:** ETH/USDC, ETH/USDT, WBTC/USDC, WBTC/ETH
+- **Tracked DeFi tokens:** UNI, AAVE, LDO, PENDLE, CRV, ENA, MKR, MORPHO, LINK, ARB
+- **Tracked airdrops:** UNI, ARB, ENA, EIGEN, MORPHO, ETHFI (airdrop-aware PnL — see [ADR 0001](docs/decisions/0001-airdrop-selection.md))
+- **Stablecoin activity tracked in:** Aave, Compound, Morpho, Pendle
+- **Timeframes:** 30d, 90d
+- **Features:** Leaderboard, wallet detail page, filters (timeframe, category, trade size, minimum activity)
 
-Full scope, conventions and open questions: [CLAUDE.md](CLAUDE.md).
+Explicitly out of scope for V1: Solana, real-time alerts, cross-chain wallet linking, NFTs, unrealized PnL.
 
 ## Tech stack
 
-- **Data:** Dune Analytics (DuneSQL / Trino) as the primary V1 source
-- **Pipeline:** Python 3.11+, managed with `uv`
-- **Local cache:** DuckDB
-- **Frontend:** Next.js 14 + TailwindCSS (from Week 4)
-- **Deployment:** Vercel for the frontend; scheduled jobs on GitHub Actions
-- **Quality:** `ruff` for linting and formatting, `pytest` for tests
+| Layer | Choice |
+|---|---|
+| Data source | Alchemy free tier (JSON-RPC + Transfers API + Token API) — see [ADR 0003](docs/decisions/0003-alchemy-over-dune.md) |
+| Historical prices | DefiLlama free API (primary), CoinGecko fallback |
+| Local cache | DuckDB — see [ADR 0004](docs/decisions/0004-duckdb-cache.md) |
+| Pipeline / backend | Python 3.11+, managed with `uv` |
+| Frontend (Week 5+) | Next.js 14 + TailwindCSS |
+| Deployment | Vercel (frontend); scheduled jobs on GitHub Actions |
 
 ## Project structure
 
-```
-alphawallets/
-├── CLAUDE.md              # Project context and working conventions
-├── README.md              # This file
-├── ROADMAP.md             # 5–6 week plan to V1
-├── STATUS.md              # Where the project stands right now
-├── docs/
-│   └── decisions/         # Architecture Decision Records (ADRs)
-├── queries/               # Dune SQL queries (AW_XX_*.sql)      [planned]
-├── src/alphawallets/      # Python pipeline package             [planned]
-├── tests/                 # pytest suite                        [planned]
-└── web/                   # Next.js frontend                    [planned, Week 4]
-```
+The tree below is what exists today. Only `web/` is planned but not yet created.
 
-Folders marked `[planned]` don't exist yet. They arrive in the week they're needed.
+- `CLAUDE.md` — Persistent context for Claude Code sessions
+- `README.md` — This file
+- `ROADMAP.md` — Week-by-week plan to V1
+- `STATUS.md` — Current state (updated per session)
+- `pyproject.toml` — Python packaging + tooling config
+- `uv.lock` — Reproducible dependency lock
+- `.env.example` — Environment variable template
+- `docs/decisions/` — ADRs (architectural decision records)
+- `src/alphawallets/` — Python package
+  - `fetchers/` — Raw data collection from Alchemy
+    - `uniswap_v3/` — Uniswap V3 swap events
+    - `erc20/` — ERC-20 transfers (Transfers API + Transfer events)
+  - `pipeline/` — Derived analysis over DuckDB
+    - `exploration/` — Ad-hoc notebooks and scripts
+    - `pnl/` — FIFO cost-basis PnL, airdrop-aware
+    - `categorization/` — Wallet category detection
+    - `ranking/` — Leaderboard ranking logic
+- `tests/` — pytest suite
+- `notebooks/` — Jupyter exploration
+- `data/` — DuckDB cache and raw exports (git-ignored)
+- `.github/ISSUE_TEMPLATE/` — Task, bug, idea templates
+- `web/` — Next.js frontend (**planned Week 5**)
 
 ## Getting started
 
-> The pipeline isn't built yet. These steps will grow as Week 1 progresses.
+Prerequisites:
+- Python 3.11+
+- [`uv`](https://docs.astral.sh/uv/) installed
+- An Alchemy account with an API key (free tier is enough) — [dashboard.alchemy.com](https://dashboard.alchemy.com)
 
-**Prerequisites**
-
-- Python 3.11 or newer
-- [`uv`](https://docs.astral.sh/uv/) for dependency management
-- A Dune Analytics account with API access
-
-**Install**
+Setup:
 
 ```bash
+# Clone
 git clone https://github.com/JohanVeroulis/alphawallets.git
 cd alphawallets
-uv sync                      # once pyproject.toml exists
+
+# Install dependencies
+uv sync
+
+# Configure environment
+cp .env.example .env
+# then edit .env and set ALCHEMY_API_KEY
 ```
 
-**Configure**
+Verify:
 
 ```bash
-cp .env.example .env         # once .env.example exists
-# then add your DUNE_API_KEY to .env
-```
-
-`.env` is git-ignored and must never be committed.
-
-**Run**
-
-```bash
-uv run pytest                # tests
-uv run ruff check .          # lint
-uv run ruff format .         # format
+uv run ruff check .
+uv run pytest --collect-only
 ```
 
 ## Roadmap
 
-Six weeks from data foundation to launch. Weekly milestones, deliverables and expected decisions: [ROADMAP.md](ROADMAP.md).
+Full plan: [ROADMAP.md](ROADMAP.md). Summary:
 
-Current state of play: [STATUS.md](STATUS.md).
+- **Weeks 1–2:** Alchemy fetchers, DuckDB indexing layer, historical prices
+- **Week 3:** PnL calculation (FIFO, airdrop-aware)
+- **Week 4:** Categorization (4 categories)
+- **Weeks 5–6:** Leaderboard + wallet detail (Next.js frontend)
+- **Weeks 7–8:** Polish, testing, launch
+
+The original ROADMAP targeted 5–6 weeks against Dune Analytics. Dune's Free tier went view-only in 2026, so V1 now uses Alchemy directly and owns its own indexing layer — hence the ~8-week plan. Full reasoning in [ADR 0003](docs/decisions/0003-alchemy-over-dune.md).
 
 ## Decisions
 
-Significant choices are recorded as short ADRs in [docs/decisions/](docs/decisions/), numbered and sequential. Start with the [README there](docs/decisions/README.md) for the pattern.
+Architectural decisions live in [`docs/decisions/`](docs/decisions/) as ADRs. Current ones:
+
+- [ADR 0001](docs/decisions/0001-airdrop-selection.md) — V1 airdrop selection
+- [ADR 0002](docs/decisions/0002-pandas-2x-pin.md) — Pin pandas to 2.x for V1
+- [ADR 0003](docs/decisions/0003-alchemy-over-dune.md) — Alchemy as V1 data source (replaces Dune)
+- [ADR 0004](docs/decisions/0004-duckdb-cache.md) — DuckDB as V1 local cache and analytical store
 
 ## License
 
-[MIT](LICENSE) © Ioannis Veroulis
+MIT.
