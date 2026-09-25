@@ -1,6 +1,6 @@
 # Status
 
-**Last updated:** 2026-09-24
+**Last updated:** 2026-09-25
 
 A 30-second answer to "where are we right now?". Update it at the end of each work session, or weekly at minimum. Keep the older entries short; this file is a snapshot, not a log.
 
@@ -10,6 +10,7 @@ Week 1 kickoff on the Alchemy path: setting up the first fetchers against Ethere
 
 ## Recent activity
 
+- **2026-09-24** — PR #6 merged: mechanical files cleaned of Dune references (`.env.example`, `pyproject.toml`, `uv.lock`, `STATUS.md`). PR #7 merged: `queries/` relocated to `src/alphawallets/fetchers/` (pure move, 7 renames at 100% similarity).
 - **2026-09-23** — PR #5 merged: [ADR 0003](docs/decisions/0003-alchemy-over-dune.md) records the switch from Dune to Alchemy as V1 data source. Dune Free went view-only in 2026; Analyst plan ($75/mo) not viable pre-revenue. Alchemy free tier (300M CUs/month) selected as sole V1 source.
 - **2026-09-23** — Alchemy account created; one API key enabled for Ethereum Mainnet, Base Mainnet, Arbitrum Mainnet. End-to-end connectivity verified from Python across all 3 chains (live block heights returned).
 - **2026-09-23** — PR #3 merged: complete project scaffolding — README, ROADMAP, STATUS, folder structure (`queries/`, `src/`, `tests/`, `notebooks/`, `data/`, `.github/ISSUE_TEMPLATE/`), Python packaging with uv, and [ADR 0002 — Pin pandas to 2.x for V1](docs/decisions/0002-pandas-2x-pin.md)
@@ -23,9 +24,10 @@ Week 1 kickoff on the Alchemy path: setting up the first fetchers against Ethere
 
 ## Next up
 
-1. PR #6: architectural rewrite for the Alchemy path — CLAUDE.md scope, ROADMAP, `queries/` → `src/alphawallets/fetchers/`, ADR 0004 (DuckDB as cache), remove `dune-client`
-2. First fetcher: fetch recent large swaps from Uniswap V3 on Ethereum + Base, store to the DuckDB cache, verify the data shape
-3. Historical price source investigation: test DefiLlama free API coverage for the 6 V1 airdrop tokens + 10 major DeFi tokens
+1. PR #9: rewrite CLAUDE.md for the Alchemy path — scope, conventions, open questions
+2. PR #10: rewrite ROADMAP.md (indexing-layer budget) and the six fetcher READMEs; fix the project tree in README.md and `src/alphawallets/README.md`
+3. First fetcher: recent large Uniswap V3 swaps on Ethereum + Base → DuckDB cache, verify the data shape
+4. Historical price source investigation: DefiLlama free API coverage for the 6 V1 airdrop tokens + 10 major DeFi tokens
 
 ## Open blockers
 
