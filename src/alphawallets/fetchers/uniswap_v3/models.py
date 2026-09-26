@@ -20,13 +20,13 @@ Design notes:
 """
 
 from datetime import datetime
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from alphawallets.config import Chain
+
 ADDRESS_PATTERN = r"^0x[0-9a-f]{40}$"
 TX_HASH_PATTERN = r"^0x[0-9a-f]{64}$"
-Chain = Literal["ethereum", "base"]
 
 
 class RawSwapLog(BaseModel):

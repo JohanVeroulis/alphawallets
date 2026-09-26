@@ -15,4 +15,4 @@ New protocols get their own subfolder as they are added (e.g. `aave/`, `compound
 
 ## Module naming
 
-`AW_XX_description.py` — zero-padded sequential number, never reused. See CLAUDE.md Section 6 for the full convention, including the docstring header shape.
+`aw_XX_description.py` — zero-padded sequential number, never reused. See CLAUDE.md Section 6 for the full convention, including the docstring header shape.
