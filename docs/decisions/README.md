@@ -24,3 +24,4 @@ This folder records significant decisions: what we chose, why, and what we gave 
 | [0002](0002-pandas-2x-pin.md) | Pin pandas to 2.x for V1 | Accepted |
 | [0003](0003-alchemy-over-dune.md) | Alchemy as V1 data source (replaces Dune) | Accepted |
 | [0004](0004-duckdb-cache.md) | DuckDB as V1 local cache and analytical store | Accepted |
+| [0005](0005-web3-7x-pin.md) | Pin web3.py to 7.x and eth-abi to 5.x for V1 | Accepted |
