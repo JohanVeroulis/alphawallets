@@ -107,7 +107,7 @@ uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
 
 ### Fetchers
 
-Every fetcher pulls raw data from Alchemy, decodes what it needs, and writes to DuckDB. The concrete patterns below are provisional — the first fetcher (Week 1) will refine them, and this section is updated as part of that PR.
+Every fetcher pulls raw data from Alchemy, decodes what it needs, and writes to DuckDB. The patterns below are the working conventions as of the first fetcher (AW_01 Uniswap V3 swaps), and apply to all subsequent fetchers unless a new ADR supersedes them.
 
 - Location: `src/alphawallets/fetchers/<protocol_or_domain>/<aw_XX_description>.py` where `<protocol_or_domain>` is a protocol (`uniswap_v3/`, `aave/`) or a generic data type (`erc20/`). V1 Week 1 starts with `uniswap_v3/` and `erc20/`; new protocols land as their own subfolders when needed.
 - Derived analysis lives in a sibling `src/alphawallets/pipeline/` package, organized by stage (`exploration/`, `pnl/`, `categorization/`, `ranking/`). Pipeline stages read from DuckDB and never call Alchemy directly.
