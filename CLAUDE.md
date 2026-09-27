@@ -79,9 +79,14 @@ uv sync                 # install dependencies
 uv run pytest           # run tests
 uv run ruff check .     # lint
 uv run ruff format .    # format
+
+# Run the Uniswap V3 fetcher (last 1000 blocks of USDC/WETH 0.05% on Ethereum)
+uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
+    --chain ethereum \
+    --pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640
 ```
 
-**Note on dependencies:** `pyproject.toml` currently declares `duckdb`, `pandas`, `python-dotenv`, and `httpx`. Additional dependencies (Pydantic for typed models, `web3`/`eth-abi` for ABI decoding) will be added with the first fetcher in Week 1.
+**Note on dependencies:** `pyproject.toml` declares `duckdb`, `pandas`, `python-dotenv`, `httpx`, `web3` (pinned to 7.x per [ADR 0005](docs/decisions/0005-web3-7x-pin.md)), `eth-abi` (5.x), and `pydantic` (2.x). Dev dependencies: `ruff`, `pytest`, `pytest-cov`, `ipykernel`.
 
 ## 6. Conventions
 
@@ -102,15 +107,15 @@ uv run ruff format .    # format
 
 ### Fetchers
 
-Every fetcher pulls raw data from Alchemy, decodes what it needs, and writes to DuckDB. The concrete patterns below are provisional — the first fetcher (Week 1) will refine them, and this section is updated as part of that PR.
+Every fetcher pulls raw data from Alchemy, decodes what it needs, and writes to DuckDB. The patterns below are the working conventions as of the first fetcher (AW_01 Uniswap V3 swaps), and apply to all subsequent fetchers unless a new ADR supersedes them.
 
-- Location: `src/alphawallets/fetchers/<protocol_or_domain>/<AW_XX_description>.py` where `<protocol_or_domain>` is a protocol (`uniswap_v3/`, `aave/`) or a generic data type (`erc20/`). V1 Week 1 starts with `uniswap_v3/` and `erc20/`; new protocols land as their own subfolders when needed.
+- Location: `src/alphawallets/fetchers/<protocol_or_domain>/<aw_XX_description>.py` where `<protocol_or_domain>` is a protocol (`uniswap_v3/`, `aave/`) or a generic data type (`erc20/`). V1 Week 1 starts with `uniswap_v3/` and `erc20/`; new protocols land as their own subfolders when needed.
 - Derived analysis lives in a sibling `src/alphawallets/pipeline/` package, organized by stage (`exploration/`, `pnl/`, `categorization/`, `ranking/`). Pipeline stages read from DuckDB and never call Alchemy directly.
-- Fetcher module naming: `AW_XX_description.py` where `XX` is a zero-padded sequential number, never reused (`AW_01_uniswap_v3_swaps.py`)
+- Fetcher module naming: `aw_XX_description.py` where `XX` is a zero-padded sequential number, never reused (`aw_01_uniswap_v3_swaps.py`). Lowercase — Python's snake_case module convention, enforced by ruff's N999 rule.
 - Each fetcher module exposes a single entry point (function or class) that takes explicit inputs (chain, block range, target DuckDB path) and returns a summary of what was written — no hidden globals, no reading config from module scope
-- Block-range windowing pattern: **TBD Week 1** — the first fetcher establishes how we page through `eth_getLogs` while staying under Alchemy's response-size limits
-- ABI storage: **TBD Week 1** — the first fetcher decides whether ABIs live in `src/alphawallets/abis/` as JSON files, get bundled from `eth-abi`/`web3` libraries, or both
-- Raw vs decoded tables in DuckDB: **TBD Week 1** — the first fetcher sets the naming and schema convention (likely `raw_<protocol>_<event>` and `<protocol>_<event>` for decoded, but confirmed with real data)
+- Block-range windowing pattern: fixed 10-block windows per `eth_getLogs` request. This is Alchemy's free-tier cap, discovered live and recorded in [ADR 0006](docs/decisions/0006-alchemy-eth-getlogs-block-window.md). Warm-connection rate is ~0.078s per window on both chains; backfill implications are documented in the ADR.
+- ABI storage: local JSON files under `<fetcher_dir>/abis/`, sourced from the canonical published artifact (e.g. `@uniswap/v3-core@1.0.1` via unpkg). Reproducible and bytes-identical for anyone re-fetching. Hatchling's default packaging ships them in the wheel without extra config (verified by wheel inspection).
+- Raw vs decoded tables in DuckDB: `raw_<protocol>_<event>` for verbatim audit trail, primary key `(chain, block_hash, log_index)` so reorged variants can coexist. `<protocol>_<event>` for decoded pipeline input, primary key `(chain, tx_hash, log_index)`. Reorged logs (`removed=True`) are written to the raw table but excluded from the decoded table. Writes use `INSERT OR IGNORE` for idempotent re-runs. Big integers (`int256` amounts, `uint160` sqrtPriceX96, `uint128` liquidity) are stored as `VARCHAR` — none fit DuckDB's signed HUGEINT reliably.
 - Every fetcher module starts with a docstring header: purpose, chain(s), block-range strategy, output tables
 
 Example header (shape only, not a spec — the real one lands in the first fetcher):
@@ -128,7 +133,7 @@ Output tables: raw_uniswap_v3_swap, uniswap_v3_swap
 ```
 
 ### File naming
-- Python modules and fetchers: `snake_case.py` (fetchers additionally follow the `AW_XX_description.py` pattern above)
+- Python modules and fetchers: `snake_case.py` (fetchers additionally follow the `aw_XX_description.py` pattern above)
 - Docs: `kebab-case.md`
 - ADRs: `NNNN-title.md` in `docs/decisions/`
 
