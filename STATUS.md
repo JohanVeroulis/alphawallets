@@ -1,15 +1,18 @@
 # Status
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-27
 
 A 30-second answer to "where are we right now?". Update it at the end of each work session, or weekly at minimum. Keep the older entries short; this file is a snapshot, not a log.
 
 ## Current focus
 
-Wrapping up PR #10 — the final rewrite PR for the Alchemy path. CLAUDE.md, ROADMAP, root README, `src/alphawallets/README`, and the fetcher/pipeline READMEs all now describe the Alchemy path with DuckDB as cache. Repo is ready for Week 1 fetcher work.
+First fetcher shipped. AW_01 pulls Uniswap V3 Swap events from Alchemy, decodes them, and persists both raw and decoded rows to DuckDB — idempotent, per-window writes, reorg-aware. CLI available. All three TBD Week 1 markers in CLAUDE.md Section 6 are now settled. Next: second fetcher (AW_02 ERC-20 transfers) and historical price coverage investigation.
 
 ## Recent activity
 
+- **2026-09-27** — PR #12 merged: first real code. AW_01 Uniswap V3 swap fetcher end-to-end. Pydantic models (RawSwapLog, UniswapV3Swap with frozen + Chain Literal from config as single source of truth), Alchemy client with API-key redaction (defense-in-depth for CI logs), decoder using web3's contract event decoder, DuckDB writer with idempotent INSERT OR IGNORE, orchestrator wiring fetch → decode → write with per-window commits, CLI with mutually-exclusive range modes. 75 passing tests. Live verified on both chains.
+- **2026-09-27** — [ADR 0006](docs/decisions/0006-alchemy-eth-getlogs-block-window.md) — Alchemy free-tier eth_getLogs is capped at 10 blocks per request. Discovered live during first fetcher run. Backfill still feasible on free tier: ~1.4h Ethereum 90d, ~8.4h Base 90d (measured warm rate 0.078s/window).
+- **2026-09-26** — PR #11 merged: fetcher dependencies (web3 7.16, eth-abi 5.x, pydantic 2.13). [ADR 0005](docs/decisions/0005-web3-7x-pin.md) pins web3 to 7.x for tutorial/community coverage during initial build cycle — same rationale as ADR 0002 (pandas 2.x).
 - **2026-09-25** — PR #10 in progress: architectural rewrite for the Alchemy path. Deleted the six Dune-era stage folders under `src/alphawallets/fetchers/`. Created protocol-based `fetchers/uniswap_v3/` and `fetchers/erc20/`. Created sibling `src/alphawallets/pipeline/` package with `exploration/`, `pnl/`, `categorization/`, `ranking/` stages. Rewrote ROADMAP.md as an 8-week Alchemy plan with a locked V1 scope. Rewrote root README.md and `src/alphawallets/README.md`.
 - **2026-09-25** — PR #9 merged: CLAUDE.md rewritten end-to-end for the Alchemy path. Section 3 (tech stack), 4 (timeline), 6 (conventions including new Fetchers subsection), 8, and 9 all updated. Non-goals expanded (NFTs excluded from V1). B+C engineering standards (type hints as contract, Pydantic for structured data) now explicit.
 - **2026-09-25** — PR #8 merged: [ADR 0004](docs/decisions/0004-duckdb-cache.md) records DuckDB as V1 local cache and analytical store. STATUS "Next up" refreshed after realizing it listed already-finished work.
@@ -27,10 +30,10 @@ Wrapping up PR #10 — the final rewrite PR for the Alchemy path. CLAUDE.md, ROA
 
 ## Next up
 
-1. Merge PR #10 (this in-progress work)
-2. First fetcher (Week 1): `AW_01_uniswap_v3_swaps.py` — pull Swap events from top V3 pools on Ethereum + Base, decode, write to DuckDB. Establish block-range windowing, ABI storage, raw vs decoded table naming conventions in the process.
-3. First fetcher (Week 1): `AW_02_erc20_transfers.py` — Transfers API for tracked DeFi tokens and airdrop distributions.
-4. Historical price source investigation: test DefiLlama free API coverage for the 6 V1 airdrop tokens + 10 major DeFi tokens.
+1. AW_02 — ERC-20 Transfers fetcher (Transfers API + Transfer events for tracked DeFi tokens and airdrop distributions).
+2. DefiLlama historical price coverage investigation for the 6 V1 airdrop tokens and 10 major DeFi tokens.
+3. Auto-resume for AW_01 backfill (query max block per chain+pool from raw table on start).
+4. First scheduled GitHub Actions job to keep the leaderboard fresh.
 
 ## Open blockers
 
@@ -40,9 +43,9 @@ None.
 
 | Metric | Value |
 |---|---|
+| Fetchers written | 1 / ~10 planned |
 | Wallets in universe | TBD |
-| Dune queries written | 0 |
-| Leaderboard coverage (chains) | 0 / 2 |
+| Chains connected | 2 / 2 (Ethereum, Base) |
 | Categories implemented | 0 / 4 |
-| Test coverage | TBD |
-| Last pipeline run | — |
+| Test coverage | 75 tests passing |
+| Last pipeline run | 2026-09-27 (AW_01, 20 blocks, 15 swaps) |

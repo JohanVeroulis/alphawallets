@@ -43,9 +43,13 @@ class RawSwapLog(BaseModel):
     block_hash: str = Field(pattern=TX_HASH_PATTERN)
     tx_hash: str = Field(pattern=TX_HASH_PATTERN)
     log_index: int = Field(ge=0)
+    transaction_index: int = Field(ge=0, description="Transaction index within the block")
     address: str = Field(pattern=ADDRESS_PATTERN, description="Emitting pool contract")
     topics: list[str] = Field(description="Event topics; topics[0] is the Swap signature")
     data: str = Field(description="Hex-encoded non-indexed event data")
+    removed: bool = Field(
+        default=False, description="True when the log was removed by a chain reorg"
+    )
 
     @field_validator("address", "block_hash", "tx_hash", mode="before")
     @classmethod

@@ -18,9 +18,11 @@ def valid_raw_log_kwargs() -> dict:
         "block_hash": "0x" + "a" * 64,
         "tx_hash": "0x" + "b" * 64,
         "log_index": 3,
+        "transaction_index": 12,
         "address": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
         "topics": ["0x" + "c" * 64, "0x" + "d" * 64, "0x" + "e" * 64],
         "data": "0x" + "f" * 320,
+        "removed": False,
     }
 
 
@@ -81,6 +83,16 @@ class TestRawSwapLog:
         raw = RawSwapLog(**valid_raw_log_kwargs)
         with pytest.raises(ValidationError):
             raw.block_number = 99999
+
+    def test_removed_defaults_false(self, valid_raw_log_kwargs):
+        kwargs = {k: v for k, v in valid_raw_log_kwargs.items() if k != "removed"}
+        raw = RawSwapLog(**kwargs)
+        assert raw.removed is False
+
+    def test_negative_transaction_index_rejected(self, valid_raw_log_kwargs):
+        kwargs = {**valid_raw_log_kwargs, "transaction_index": -1}
+        with pytest.raises(ValidationError):
+            RawSwapLog(**kwargs)
 
 
 # ---------- UniswapV3Swap ----------
