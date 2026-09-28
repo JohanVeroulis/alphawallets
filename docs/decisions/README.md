@@ -26,3 +26,4 @@ This folder records significant decisions: what we chose, why, and what we gave 
 | [0004](0004-duckdb-cache.md) | DuckDB as V1 local cache and analytical store | Accepted |
 | [0005](0005-web3-7x-pin.md) | Pin web3.py to 7.x and eth-abi to 5.x for V1 | Accepted |
 | [0006](0006-alchemy-eth-getlogs-block-window.md) | Alchemy free-tier eth_getLogs is capped at 10 blocks per request | Accepted |
+| [0007](0007-alchemy-cups-constraint.md) | Alchemy free-tier CUPS constrains request concentration, not total volume | Accepted |
