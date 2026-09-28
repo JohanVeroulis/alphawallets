@@ -35,6 +35,7 @@ def valid_swap_kwargs() -> dict:
         "tx_hash": "0x" + "a" * 64,
         "log_index": 3,
         "pool_address": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+        "tx_from": "0x" + "9" * 40,
         "sender": "0x" + "1" * 40,
         "recipient": "0x" + "2" * 40,
         "amount0": -1_500_000_000,
@@ -141,3 +142,18 @@ class TestUniswapV3Swap:
         swap = UniswapV3Swap(**valid_swap_kwargs)
         with pytest.raises(ValidationError):
             swap.tick = 0
+
+    def test_tx_from_lowercased(self, valid_swap_kwargs):
+        kwargs = {**valid_swap_kwargs, "tx_from": "0xABCDEF" + "0" * 34}
+        swap = UniswapV3Swap(**kwargs)
+        assert swap.tx_from == "0xabcdef" + "0" * 34
+
+    def test_tx_from_required(self, valid_swap_kwargs):
+        kwargs = {k: v for k, v in valid_swap_kwargs.items() if k != "tx_from"}
+        with pytest.raises(ValidationError):
+            UniswapV3Swap(**kwargs)
+
+    def test_tx_from_invalid_rejected(self, valid_swap_kwargs):
+        kwargs = {**valid_swap_kwargs, "tx_from": "not-an-address"}
+        with pytest.raises(ValidationError):
+            UniswapV3Swap(**kwargs)

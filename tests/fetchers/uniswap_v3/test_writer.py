@@ -48,6 +48,7 @@ def decoded_swap() -> UniswapV3Swap:
         tx_hash="0x" + "b" * 64,
         log_index=73,
         pool_address="0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+        tx_from="0x" + "9" * 40,
         sender="0x" + "1" * 40,
         recipient="0x" + "2" * 40,
         amount0=-55_923_401,

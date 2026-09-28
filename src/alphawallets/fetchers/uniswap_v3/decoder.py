@@ -95,6 +95,7 @@ def decode_swap_log(
     log: dict[str, Any],
     swap_event: ContractEvent,
     chain: Chain,
+    tx_from: str,
 ) -> UniswapV3Swap:
     """Decode one raw Swap log into a UniswapV3Swap.
 
@@ -102,6 +103,8 @@ def decode_swap_log(
         log: An eth_getLogs entry (dict with topics, data, block metadata).
         swap_event: The decoder built once via make_swap_event_decoder(w3).
         chain: The chain this log came from (ethereum or base).
+        tx_from: The transaction signer's address (EOA), fetched separately
+            via eth_getTransactionByHash. Distinct from log's sender (router).
 
     Returns:
         A validated UniswapV3Swap.
@@ -127,6 +130,7 @@ def decode_swap_log(
         tx_hash=_hex_str(log["transactionHash"]),
         log_index=log["logIndex"],
         pool_address=_hex_str(log["address"]),
+        tx_from=_hex_str(tx_from),
         sender=_hex_str(args["sender"]),
         recipient=_hex_str(args["recipient"]),
         amount0=int(args["amount0"]),
@@ -135,3 +139,26 @@ def decode_swap_log(
         liquidity=int(args["liquidity"]),
         tick=int(args["tick"]),
     )
+
+
+def fetch_tx_from_map(w3: Web3, logs: list[dict[str, Any]]) -> dict[str, str]:
+    """Look up transaction signer (tx.from) for every unique tx_hash in logs.
+
+    Uses eth_getTransactionByHash per unique tx — surgical (only fetches
+    what's needed) and comparable in CU cost to per-block fetching. See
+    Issue #13 for the trade-off analysis.
+
+    Args:
+        w3: Live Web3 instance (make_web3 output).
+        logs: List of eth_getLogs entries. Each must have transactionHash.
+
+    Returns:
+        Dict mapping lowercase 0x-prefixed tx_hash to lowercase 0x-prefixed
+        from-address (EOA).
+    """
+    unique_hashes = {_hex_str(log["transactionHash"]) for log in logs}
+    result: dict[str, str] = {}
+    for tx_hash in unique_hashes:
+        tx = w3.eth.get_transaction(tx_hash)
+        result[tx_hash] = _hex_str(tx["from"])
+    return result

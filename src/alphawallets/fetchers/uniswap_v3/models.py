@@ -83,6 +83,11 @@ class UniswapV3Swap(BaseModel):
     tx_hash: str = Field(pattern=TX_HASH_PATTERN)
     log_index: int = Field(ge=0, description="Log index within the block")
     pool_address: str = Field(pattern=ADDRESS_PATTERN)
+    tx_from: str = Field(
+        pattern=ADDRESS_PATTERN,
+        description="EOA that signed the transaction. Distinct from `sender`, "
+        "which is the contract that called pool.swap() (usually a router).",
+    )
     sender: str = Field(pattern=ADDRESS_PATTERN, description="Router or msg.sender")
     recipient: str = Field(pattern=ADDRESS_PATTERN, description="Recipient of the output tokens")
     amount0: int = Field(description="int256; signed. Positive = into pool.")
@@ -91,7 +96,7 @@ class UniswapV3Swap(BaseModel):
     liquidity: int = Field(ge=0, description="uint128; pool liquidity at time of swap")
     tick: int = Field(description="int24; current pool tick after swap")
 
-    @field_validator("pool_address", "sender", "recipient", "tx_hash", mode="before")
+    @field_validator("pool_address", "sender", "recipient", "tx_hash", "tx_from", mode="before")
     @classmethod
     def _lowercase_hex(cls, v: str) -> str:
         return v.lower() if isinstance(v, str) else v

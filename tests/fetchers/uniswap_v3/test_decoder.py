@@ -16,6 +16,9 @@ from alphawallets.fetchers.uniswap_v3.decoder import (
 )
 from alphawallets.fetchers.uniswap_v3.models import RawSwapLog, UniswapV3Swap
 
+SAMPLE_TX_FROM = "0x" + "e" * 40
+
+
 # ---------- Fixtures ----------
 
 
@@ -157,13 +160,17 @@ class TestToRawSwapLog:
 
 class TestDecodeSwapLog:
     def test_basic_decode(self, fixture_swap_log, swap_event):
-        decoded = decode_swap_log(fixture_swap_log, swap_event, chain="ethereum")
+        decoded = decode_swap_log(
+            fixture_swap_log, swap_event, chain="ethereum", tx_from=SAMPLE_TX_FROM
+        )
         assert isinstance(decoded, UniswapV3Swap)
         assert decoded.chain == "ethereum"
         assert decoded.block_number == 26067040
 
     def test_addresses_lowercased(self, fixture_swap_log, swap_event):
-        decoded = decode_swap_log(fixture_swap_log, swap_event, chain="ethereum")
+        decoded = decode_swap_log(
+            fixture_swap_log, swap_event, chain="ethereum", tx_from=SAMPLE_TX_FROM
+        )
         assert decoded.pool_address == decoded.pool_address.lower()
         assert decoded.sender == decoded.sender.lower()
         assert decoded.recipient == decoded.recipient.lower()
@@ -173,29 +180,55 @@ class TestDecodeSwapLog:
 
     def test_amounts_signed(self, fixture_swap_log, swap_event):
         # From the live fixture: 5,565.00 USDC in, 2.055 WETH out
-        decoded = decode_swap_log(fixture_swap_log, swap_event, chain="ethereum")
+        decoded = decode_swap_log(
+            fixture_swap_log, swap_event, chain="ethereum", tx_from=SAMPLE_TX_FROM
+        )
         assert decoded.amount0 > 0
         assert decoded.amount1 < 0
         # Sign convention: opposite signs (invariant of a swap)
         assert (decoded.amount0 > 0) != (decoded.amount1 > 0)
 
     def test_block_timestamp_parsed(self, fixture_swap_log, swap_event):
-        decoded = decode_swap_log(fixture_swap_log, swap_event, chain="ethereum")
+        decoded = decode_swap_log(
+            fixture_swap_log, swap_event, chain="ethereum", tx_from=SAMPLE_TX_FROM
+        )
         assert decoded.block_timestamp.tzinfo is UTC
 
     def test_missing_block_timestamp_raises(self, fixture_swap_log, swap_event):
         log = {k: v for k, v in fixture_swap_log.items() if k != "blockTimestamp"}
         with pytest.raises(ValueError, match="blockTimestamp"):
-            decode_swap_log(log, swap_event, chain="ethereum")
+            decode_swap_log(log, swap_event, chain="ethereum", tx_from=SAMPLE_TX_FROM)
 
     def test_invalid_chain_rejected(self, fixture_swap_log, swap_event):
         with pytest.raises(ValidationError):
-            decode_swap_log(fixture_swap_log, swap_event, chain="solana")  # type: ignore[arg-type]
+            decode_swap_log(
+                fixture_swap_log,
+                swap_event,
+                chain="solana",  # type: ignore[arg-type]
+                tx_from=SAMPLE_TX_FROM,
+            )
 
     def test_sqrt_price_and_liquidity_positive(self, fixture_swap_log, swap_event):
-        decoded = decode_swap_log(fixture_swap_log, swap_event, chain="ethereum")
+        decoded = decode_swap_log(
+            fixture_swap_log, swap_event, chain="ethereum", tx_from=SAMPLE_TX_FROM
+        )
         assert decoded.sqrt_price_x96 > 0
         assert decoded.liquidity >= 0
+
+    def test_tx_from_passed_through(self, fixture_swap_log, swap_event):
+        decoded = decode_swap_log(
+            fixture_swap_log, swap_event, chain="ethereum", tx_from="0x" + "f" * 40
+        )
+        assert decoded.tx_from == "0x" + "f" * 40
+
+    def test_tx_from_lowercased_on_decode(self, fixture_swap_log, swap_event):
+        decoded = decode_swap_log(
+            fixture_swap_log,
+            swap_event,
+            chain="ethereum",
+            tx_from="0xABCDEF" + "0" * 34,
+        )
+        assert decoded.tx_from == "0xabcdef" + "0" * 34
 
 
 # ---------- make_swap_event_decoder ----------
@@ -214,3 +247,64 @@ class TestMakeSwapEventDecoder:
         # The event must expose process_log — that's the interface decode_swap_log uses
         assert hasattr(swap_event, "process_log")
         assert callable(swap_event.process_log)
+
+
+class TestFetchTxFromMap:
+    """Tests for fetch_tx_from_map — uses mock w3 to avoid RPC calls."""
+
+    def test_empty_logs_returns_empty_dict(self):
+        from unittest.mock import MagicMock
+
+        from alphawallets.fetchers.uniswap_v3.decoder import fetch_tx_from_map
+
+        w3 = MagicMock()
+        result = fetch_tx_from_map(w3, [])
+        assert result == {}
+        w3.eth.get_transaction.assert_not_called()
+
+    def test_dedup_unique_tx_hashes(self):
+        from unittest.mock import MagicMock
+
+        from hexbytes import HexBytes
+
+        from alphawallets.fetchers.uniswap_v3.decoder import fetch_tx_from_map
+
+        # Three logs, only two unique tx_hashes
+        tx_a = HexBytes("0x" + "a" * 64)
+        tx_b = HexBytes("0x" + "b" * 64)
+        logs = [
+            {"transactionHash": tx_a},
+            {"transactionHash": tx_b},
+            {"transactionHash": tx_a},  # duplicate
+        ]
+
+        w3 = MagicMock()
+        w3.eth.get_transaction.side_effect = lambda tx_hash: {
+            "from": "0xEEE" + tx_hash[3:42]  # simple mock: from-address encodes tx_hash
+        }
+
+        result = fetch_tx_from_map(w3, logs)
+
+        # Two unique tx_hashes → two lookups (not three)
+        assert w3.eth.get_transaction.call_count == 2
+        assert len(result) == 2
+        assert "0x" + "a" * 64 in result
+        assert "0x" + "b" * 64 in result
+
+    def test_result_addresses_lowercased(self):
+        from unittest.mock import MagicMock
+
+        from hexbytes import HexBytes
+
+        from alphawallets.fetchers.uniswap_v3.decoder import fetch_tx_from_map
+
+        tx = HexBytes("0x" + "a" * 64)
+        logs = [{"transactionHash": tx}]
+
+        w3 = MagicMock()
+        w3.eth.get_transaction.return_value = {
+            "from": "0xAaBbCcDdEeFf" + "0" * 28,
+        }
+
+        result = fetch_tx_from_map(w3, logs)
+        assert result["0x" + "a" * 64] == "0xaabbccddeeff" + "0" * 28

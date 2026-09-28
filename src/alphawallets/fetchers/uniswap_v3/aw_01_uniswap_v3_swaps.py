@@ -39,7 +39,9 @@ from alphawallets.alchemy_client import make_web3
 from alphawallets.config import Chain
 from alphawallets.db import connect
 from alphawallets.fetchers.uniswap_v3.decoder import (
+    _hex_str,
     decode_swap_log,
+    fetch_tx_from_map,
     make_swap_event_decoder,
     to_raw_swap_log,
 )
@@ -272,7 +274,18 @@ def fetch_and_persist_swaps(
             live_logs = [log for log in logs if not log.get("removed", False)]
             reorged_excluded += len(logs) - len(live_logs)
 
-            decoded_records = [decode_swap_log(log, swap_event, chain=chain) for log in live_logs]
+            # Enrich decoded rows with tx_from (real EOA, not router)
+            tx_from_map = fetch_tx_from_map(w3, live_logs)
+
+            decoded_records = [
+                decode_swap_log(
+                    log,
+                    swap_event,
+                    chain=chain,
+                    tx_from=tx_from_map[_hex_str(log["transactionHash"])],
+                )
+                for log in live_logs
+            ]
             n_decoded_inserted = write_decoded_swaps(conn, decoded_records)
             decoded_written += n_decoded_inserted
             decoded_skipped += len(decoded_records) - n_decoded_inserted
