@@ -32,9 +32,9 @@ Implications for V1 backfill scope. Wall-clock has been measured three times as 
 ² Measured 2026-09-27, PR #12: fetch + per-window DuckDB write, 0.151s per window on Ethereum.
 ³ Measured 2026-09-28, PR #13 (#15): full pipeline with tx_from enrichment via one eth_getTransactionByHash per unique tx. ~0.9s per window with ~13 swaps/window on Ethereum. Extrapolations assume similar swap density on Base.
 
-The tx_from step's cost dominates. It surfaced from a data-model gap (Swap.sender is the router, not the trader — see PR #13) that couldn't be avoided, but the fetch pattern is naive: one HTTP round-trip per unique tx_hash. JSON-RPC batching of eth_getTransactionByHash — Alchemy supports it, and web3 7.x has a batch_requests() context manager — is expected to cut the tx_from step's cost by roughly 10×, restoring Base 90d to ~12 hours. Batching is tracked as a follow-up issue.
+The tx_from step's cost dominates. It surfaced from a data-model gap (Swap.sender is the router, not the trader — see PR #13) that couldn't be avoided. JSON-RPC batching of eth_getTransactionByHash was investigated as a mitigation and abandoned — see [ADR 0007](0007-alchemy-cups-constraint.md) for why the free-tier compute-units-per-second cap makes batching counter-productive on this plan.
 
-These are per pool. V1 tracks ~4 major pairs on each chain, and ERC-20 fetchers add more; total backfill without batching is many days. With batching, expected back to hours-per-chain-per-fetcher. Once caught up, incremental fetching (new blocks only) stays fast — the pain is one-time.
+These are per pool. V1 tracks ~4 major pairs on each chain, and ERC-20 fetchers add more; total backfill is many days on the free tier. Once caught up, incremental fetching (new blocks only) stays fast — the pain is one-time. Restoring practical backfill wall-clock requires either the Alchemy Growth tier or a scope decision on the 90d window (see ADR 0007).
 
 ## Decision
 
@@ -67,6 +67,6 @@ For V1.5 and later:
 - A concrete window size that all eth_getLogs-based fetchers can share as a constant.
 
 **What we lose / take on:**
-- Initial backfill for a single pool on Base at 90d is ~4-5 days of wall-clock with the current pipeline (measured 2026-09-28, PR #13). This makes an unbatched backfill impractical at V1 scope; the batching follow-up restores it to ~12 h. Full V1 backfill across all fetchers and both chains is a batching-gated milestone, not something to attempt against the naive pipeline.
+- Initial backfill for a single pool on Base at 90d is ~4-5 days of wall-clock with the current pipeline (measured 2026-09-28, PR #13). Batching was investigated and rejected — [ADR 0007](0007-alchemy-cups-constraint.md) explains why the free-tier CUPS cap makes batching counter-productive. Restoring practical backfill requires either the Alchemy Growth tier or a scope decision on the 90d window.
 - Fetchers must handle long-running runs gracefully: resumable state, progress logging, and idempotent writes to DuckDB (won't re-insert duplicates on restart).
 - Any tutorial or example that assumes larger eth_getLogs windows won't apply here — a small friction on future development.
