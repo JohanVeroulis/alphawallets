@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS uniswap_v3_swap (
     tx_hash          VARCHAR     NOT NULL,
     log_index        INTEGER     NOT NULL,
     pool_address     VARCHAR     NOT NULL,
+    tx_from          VARCHAR     NOT NULL,
     sender           VARCHAR     NOT NULL,
     recipient        VARCHAR     NOT NULL,
     amount0          VARCHAR     NOT NULL,
@@ -138,6 +139,7 @@ def write_decoded_swaps(conn: DuckDBPyConnection, swaps: list[UniswapV3Swap]) ->
             swap.tx_hash,
             swap.log_index,
             swap.pool_address,
+            swap.tx_from,
             swap.sender,
             swap.recipient,
             str(swap.amount0),
@@ -149,7 +151,7 @@ def write_decoded_swaps(conn: DuckDBPyConnection, swaps: list[UniswapV3Swap]) ->
         for swap in swaps
     ]
     conn.executemany(
-        "INSERT OR IGNORE INTO uniswap_v3_swap VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO uniswap_v3_swap VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     inserted = _row_count(conn, "uniswap_v3_swap") - before
