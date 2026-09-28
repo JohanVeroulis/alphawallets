@@ -19,25 +19,29 @@ Follow-up measurement confirmed the exact boundary on both V1 chains:
 
 The block-window planning in ADR 0003 assumed generous eth_getLogs limits (the JSON-RPC spec allows up to 10,000 blocks in principle). The free-tier cap is 10, inclusive. This surfaced only when the fetcher went live — no Alchemy documentation page listed it prominently.
 
-Implications for V1 backfill scope, measured on a warm connection (2026-09-26, USDC/WETH 0.05% pool, 100 sequential requests on Ethereum; independently confirmed on Base's USDC/WETH 0.05% pool at 0.077s/window):
+Implications for V1 backfill scope. Wall-clock has been measured three times as the pipeline gained more per-window work; the picture that plans should use is the rightmost column:
 
-| Scope                                | Blocks    | Requests @ 10/window | Wall-clock @ 0.079s/request |
-| ------------------------------------ | --------- | -------------------- | --------------------------- |
-| Ethereum, 30 days, 1 pool            | 216,000   | 21,600               | ~0.5 hours                  |
-| Ethereum, 90 days, 1 pool            | 648,000   | 64,800               | ~1.4 hours                  |
-| Base, 30 days, 1 pool                | 1,296,000 | 129,600              | ~2.8 hours                  |
-| Base, 90 days, 1 pool                | 3,900,000 | 390,000              | ~8.4 hours                  |
+| Scope                       | Blocks    | Windows | Fetch only ¹ | + Persist ² | + tx_from ³ |
+| --------------------------- | --------- | ------- | ------------ | ----------- | ----------- |
+| Ethereum, 30 days, 1 pool   | 216,000   | 21,600  | ~0.5 h       | ~1.0 h      | ~5-7 h      |
+| Ethereum, 90 days, 1 pool   | 648,000   | 64,800  | ~1.4 h       | ~2.7 h      | ~15-20 h    |
+| Base, 30 days, 1 pool       | 1,296,000 | 129,600 | ~2.8 h       | ~5.4 h      | ~28-35 h    |
+| Base, 90 days, 1 pool       | 3,900,000 | 390,000 | ~8.4 h       | ~17 h       | ~4-5 days   |
 
-Initial estimates used 0.2s/request based on a single cold call. Steady-state cost with connection reuse is 2.5x lower. Numbers assume no rate limiting; the free tier's requests-per-second cap may extend real backfill.
+¹ Measured 2026-09-26: warm eth_getLogs only, 0.078s per window on both chains.
+² Measured 2026-09-27, PR #12: fetch + per-window DuckDB write, 0.151s per window on Ethereum.
+³ Measured 2026-09-28, PR #13 (#15): full pipeline with tx_from enrichment via one eth_getTransactionByHash per unique tx. ~0.9s per window with ~13 swaps/window on Ethereum. Extrapolations assume similar swap density on Base.
 
-These are per pool. V1 tracks ~4 major pairs on each chain, and ERC-20 fetchers add more, so total backfill is roughly a day across all fetchers and both chains at worst. Once caught up, incremental fetching (new blocks only) is fast — the pain is one-time.
+The tx_from step's cost dominates. It surfaced from a data-model gap (Swap.sender is the router, not the trader — see PR #13) that couldn't be avoided, but the fetch pattern is naive: one HTTP round-trip per unique tx_hash. JSON-RPC batching of eth_getTransactionByHash — Alchemy supports it, and web3 7.x has a batch_requests() context manager — is expected to cut the tx_from step's cost by roughly 10×, restoring Base 90d to ~12 hours. Batching is tracked as a follow-up issue.
+
+These are per pool. V1 tracks ~4 major pairs on each chain, and ERC-20 fetchers add more; total backfill without batching is many days. With batching, expected back to hours-per-chain-per-fetcher. Once caught up, incremental fetching (new blocks only) stays fast — the pain is one-time.
 
 ## Decision
 
 For V1:
 
 - Set BLOCK_WINDOW_SIZE = 10 in every eth_getLogs-based fetcher.
-- Accept that initial backfill runs several hours per chain per fetcher — ~1.4h for Ethereum 90d, ~8.4h for Base 90d (measured 2026-09-26).
+- Accept that initial backfill runs are the pipeline's dominant cost, and that they are re-measured as the pipeline evolves. The rightmost column of the Context table is the current planning figure.
 - Do not adopt Alchemy PAYG at this stage. Backfill runs are a one-off cost and V1 must ship pre-revenue (ADR 0003 constraint).
 - Timeline impact: absorb inside the existing Week 1-2 window rather than extending the ROADMAP again. Backfill runs happen in the background while other pipeline work continues.
 
@@ -63,6 +67,6 @@ For V1.5 and later:
 - A concrete window size that all eth_getLogs-based fetchers can share as a constant.
 
 **What we lose / take on:**
-- Initial backfill for a single pool on Base at 90d is ~8.4 hours of wall-clock (measured). Full V1 backfill across all fetchers and both chains fits inside a day at a stretch, longer if rate limiting kicks in.
+- Initial backfill for a single pool on Base at 90d is ~4-5 days of wall-clock with the current pipeline (measured 2026-09-28, PR #13). This makes an unbatched backfill impractical at V1 scope; the batching follow-up restores it to ~12 h. Full V1 backfill across all fetchers and both chains is a batching-gated milestone, not something to attempt against the naive pipeline.
 - Fetchers must handle long-running runs gracefully: resumable state, progress logging, and idempotent writes to DuckDB (won't re-insert duplicates on restart).
 - Any tutorial or example that assumes larger eth_getLogs windows won't apply here — a small friction on future development.
