@@ -42,7 +42,7 @@ Anything not listed here is out of scope. If a task drifts outside it, stop and 
 | Layer | Choice |
 |---|---|
 | Data source | Alchemy free tier (300M CUs/month) — JSON-RPC + Transfers API + Token API. V1 chains: Ethereum + Base. Arbitrum is enabled on the account but out of V1 scope (kept as V1.5 optionality). |
-| Historical prices | DefiLlama free API (primary candidate, coverage TBD Week 1); CoinGecko fallback for gaps |
+| Historical prices | DefiLlama free API — coverage verified for all V1 tracked tokens, see [ADR 0008](docs/decisions/0008-defillama-historical-prices.md) |
 | Local cache | DuckDB single-file store — see [ADR 0004](docs/decisions/0004-duckdb-cache.md) |
 | Pipeline / backend | Python 3.11+, managed with `uv` |
 | Frontend (Week 5+) | Next.js 14 + TailwindCSS |
@@ -177,12 +177,11 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 - [x] **Local cache:** DuckDB — see [ADR 0004](docs/decisions/0004-duckdb-cache.md)
 - [x] **Scheduled jobs:** GitHub Actions to start with (free, integrated, sufficient for V1; single-writer DuckDB implications noted in ADR 0004)
 - [x] **NFTs:** excluded from V1 tracking entirely — noise/wash-trading, illiquid pricing, and different PnL semantics from ERC-20
+- [x] **Historical price coverage:** verified against DefiLlama for the 12 V1 tracked tokens (union of 6 airdrops + 10 DeFi) across 4 dates spanning a full year. 100% coverage — see [ADR 0008](docs/decisions/0008-defillama-historical-prices.md). CoinGecko stays in reserve for tokens outside the tracked set.
 
 ### Provisional (validate in Weeks 1–3 with real data)
 
 - [~] **PnL methodology:** realized PnL with FIFO cost basis for V1; unrealized PnL in V1.5.
-
-- [~] **Historical price source:** DefiLlama free API as primary candidate (no key required, historical coverage). Coverage validation in Week 1 for the 6 V1 airdrop tokens (UNI, ARB, ENA, EIGEN, MORPHO, ETHFI) and 10 major DeFi tokens (UNI, AAVE, LDO, PENDLE, CRV, ENA, MKR, MORPHO, LINK, ARB). Fallback for gaps: CoinGecko free tier (rate-limited, mostly daily-granularity) or derived USD from DEX pool swap rates at trade time. Full recording in ADR 0003.
 
 - [~] **"Consistently profitable":** at least 10 trades in the window, positive net PnL, activity within the last 30 days.
 
