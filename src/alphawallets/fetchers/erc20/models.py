@@ -56,7 +56,9 @@ class RawAssetTransfer(BaseModel):
     )
     value_decimal: float | None = Field(
         default=None,
-        description="Human-readable amount (API's 'value' field). None for very large or malformed values.",
+        description=(
+            "Human-readable amount (API's 'value' field). None for very large or malformed values."
+        ),
     )
     asset: str | None = Field(default=None, description="Symbol as reported by Alchemy, e.g. 'UNI'")
     category: str = Field(description="Transfer category: 'erc20' for this fetcher")
