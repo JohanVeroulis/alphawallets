@@ -10,9 +10,12 @@ Two models are exposed:
 Design notes:
 - Addresses are lowercase 0x-prefixed hex strings, 42 chars — same convention
   as AW_01.
-- `value_raw` is the token amount in base units (uint256 as string) taken from
-  the API's `rawContract.value` field. Stored as VARCHAR because it does not
-  fit DuckDB's signed HUGEINT for large-supply tokens.
+- `value_raw` is the token amount in base units, held as a DECIMAL string. The
+  API reports `rawContract.value` as hex; the mapper converts it so DuckDB can
+  `CAST(value_raw AS DECIMAL)` and the pipeline can compare magnitudes without
+  re-parsing. The conversion is lossless (`hex(int(value_raw))` recovers the
+  original). Stored as VARCHAR because a uint256 does not fit DuckDB's signed
+  HUGEINT for large-supply tokens.
 - `value_decimal` is a human-readable float (API's `value` field). Convenient
   for spot-checks; not authoritative — always compute from value_raw + decimals
   in the pipeline.
@@ -52,7 +55,10 @@ class RawAssetTransfer(BaseModel):
     from_addr: str = Field(pattern=ADDRESS_PATTERN)
     to_addr: str = Field(pattern=ADDRESS_PATTERN)
     value_raw: str = Field(
-        description="uint256 token amount in base units, as string (from rawContract.value)"
+        description=(
+            "uint256 token amount in base units, as a decimal string "
+            "(converted from rawContract.value, which arrives as hex)"
+        )
     )
     value_decimal: float | None = Field(
         default=None,

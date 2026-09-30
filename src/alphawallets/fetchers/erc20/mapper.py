@@ -101,6 +101,11 @@ def to_raw_asset_transfer(entry: dict[str, Any], chain: Chain) -> RawAssetTransf
         )
         return None
 
+    tx_hash = entry.get("hash")
+    if not tx_hash:
+        logger.warning("Skipping transfer %s: missing hash", unique_id)
+        return None
+
     metadata = entry.get("metadata") or {}
 
     try:
@@ -108,7 +113,7 @@ def to_raw_asset_transfer(entry: dict[str, Any], chain: Chain) -> RawAssetTransf
             chain=chain,
             unique_id=unique_id,
             block_num=block_num,
-            tx_hash=entry["hash"],
+            tx_hash=tx_hash,
             from_addr=entry["from"],
             to_addr=entry["to"],
             # Decimal string, not hex: DuckDB can CAST it and the pipeline can
