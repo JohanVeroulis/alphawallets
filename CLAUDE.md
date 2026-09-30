@@ -84,6 +84,12 @@ uv run ruff format .    # format
 uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
     --chain ethereum \
     --pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640
+
+# Run the ERC-20 transfers fetcher (last 1000 blocks of UNI on Ethereum)
+uv run python -m alphawallets.fetchers.erc20.aw_02_erc20_transfers \
+    --chain ethereum \
+    --contract 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
+    --blocks 1000
 ```
 
 **Note on dependencies:** `pyproject.toml` declares `duckdb`, `pandas`, `python-dotenv`, `httpx`, `web3` (pinned to 7.x per [ADR 0005](docs/decisions/0005-web3-7x-pin.md)), `eth-abi` (5.x), and `pydantic` (2.x). Dev dependencies: `ruff`, `pytest`, `pytest-cov`, `ipykernel`.
@@ -177,6 +183,7 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 - [x] **Local cache:** DuckDB — see [ADR 0004](docs/decisions/0004-duckdb-cache.md)
 - [x] **Scheduled jobs:** GitHub Actions to start with (free, integrated, sufficient for V1; single-writer DuckDB implications noted in ADR 0004)
 - [x] **NFTs:** excluded from V1 tracking entirely — noise/wash-trading, illiquid pricing, and different PnL semantics from ERC-20
+- [x] **Transfers API vs `eth_getLogs`:** Decided — Transfers API for bulk ERC-20 backfill (no block-window cap, pre-decoded, `logIndex` always absent for ERC-20 category which mandates a `unique_id`-based PK); `eth_getLogs` for protocol-specific event decoding (e.g. Uniswap Swap). See PR #20 and `fetchers/erc20/README.md`.
 - [x] **Historical price coverage:** verified against DefiLlama for the 12 V1 tracked tokens (union of 6 airdrops + 10 DeFi) across 4 dates spanning a full year. 100% coverage — see [ADR 0008](docs/decisions/0008-defillama-historical-prices.md). CoinGecko stays in reserve for tokens outside the tracked set.
 
 ### Provisional (validate in Weeks 1–3 with real data)
@@ -194,7 +201,6 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 ### Open
 
 - [ ] **Uniswap version priority:** V2 and V3 both exist across ETH + Base. Start with V3 (higher volume, better data), add V2 in Week 2. Confirm in Week 1.
-- [ ] **Transfers API vs `eth_getLogs`:** Alchemy's Transfers API gives pre-decoded ERC-20 transfers; `eth_getLogs` gives raw logs including protocol-specific events. First fetcher decides the split by protocol.
 - [ ] **ABI storage strategy:** local JSON files in `src/alphawallets/abis/` vs bundled from web3 libraries — decide with the first fetcher.
 - [ ] **Category thresholds:** numeric values per category, to be set from real data (Week 4).
 - [ ] **Wallet cluster detection:** approach for identifying wallets that share funding origin or coordinated behavior (V2 feature, but detection method affects V1 data collection). Placeholder for later ADR.
