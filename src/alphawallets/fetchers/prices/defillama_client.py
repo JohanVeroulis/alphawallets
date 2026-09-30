@@ -78,6 +78,33 @@ def period_seconds(period: str) -> int:
     return _PERIOD_SECONDS[period]
 
 
+def chunk_plan(span_days: int, period: str) -> tuple[int, int, int]:
+    """Work out how a span will be split into requests.
+
+    Shared by fetch_chart and the CLI summary so both report the same plan —
+    duplicating this arithmetic is how a summary line starts lying.
+
+    Args:
+        span_days: How many days of history to cover.
+        period: Sampling interval, e.g. '1h'.
+
+    Returns:
+        (total_points, n_chunks, chunk_span). Chunks are balanced rather than
+        cap-filled, so every request has the same shape.
+
+    Raises:
+        ValueError: On a non-positive span_days or an unsupported period.
+    """
+    if span_days <= 0:
+        raise ValueError(f"span_days must be positive, got {span_days}")
+
+    step = period_seconds(period)
+    total_points = math.ceil(span_days * 86400 / step)
+    n_chunks = math.ceil(total_points / MAX_POINTS_PER_REQUEST)
+    chunk_span = math.ceil(total_points / n_chunks)
+    return total_points, n_chunks, chunk_span
+
+
 def fetch_chart_chunk(
     client: httpx.Client,
     chain: str,
@@ -141,16 +168,27 @@ def fetch_chart_chunk(
 
     # Flatten coin-level metadata onto every point so the mapper works from a
     # single dict per observation.
-    return [
-        {
-            "timestamp": point["timestamp"],
-            "price": point["price"],
-            "symbol": symbol,
-            "decimals": decimals,
-            "confidence": confidence,
-        }
-        for point in entry.get("prices", [])
-    ]
+    #
+    # Points without an integer timestamp are dropped here rather than passed
+    # on: fetch_chart de-duplicates and sorts on that field, so a null would
+    # abort the whole span over one bad entry. Price validation stays the
+    # mapper's job — only the field this layer depends on is enforced.
+    flattened: list[dict[str, Any]] = []
+    for point in entry.get("prices", []):
+        timestamp = point.get("timestamp")
+        if not isinstance(timestamp, int):
+            logger.warning("Dropping %s point with unusable timestamp %r", cid, timestamp)
+            continue
+        flattened.append(
+            {
+                "timestamp": timestamp,
+                "price": point.get("price"),
+                "symbol": symbol,
+                "decimals": decimals,
+                "confidence": confidence,
+            }
+        )
+    return flattened
 
 
 def fetch_chart(
@@ -182,15 +220,8 @@ def fetch_chart(
         ValueError: On a non-positive span_days, an unsupported period, or an
             API rejection.
     """
-    if span_days <= 0:
-        raise ValueError(f"span_days must be positive, got {span_days}")
-
+    total_points, n_chunks, chunk_span = chunk_plan(span_days, period)
     step = period_seconds(period)
-    total_points = math.ceil(span_days * 86400 / step)
-    n_chunks = math.ceil(total_points / MAX_POINTS_PER_REQUEST)
-    # Balance the chunks rather than filling the first ones to the cap: an even
-    # split keeps every request the same shape, which makes the logs readable.
-    chunk_span = math.ceil(total_points / n_chunks)
 
     start_ts = int((datetime.now(tz=UTC) - timedelta(days=span_days)).timestamp())
 

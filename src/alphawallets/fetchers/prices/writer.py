@@ -44,6 +44,10 @@ logger = logging.getLogger(__name__)
 # ---------- Schema ----------
 
 
+# Semantic note for PnL developers reading this table: when two observations
+# fall inside the same hour, INSERT OR IGNORE keeps the FIRST one written.
+# A row therefore represents the earliest observed price in that hour, not the
+# last and not an average. Verified in test_writer.py::TestSameHourCollision.
 TOKEN_PRICE_DDL = """
 CREATE TABLE IF NOT EXISTS token_price (
     chain          VARCHAR     NOT NULL,

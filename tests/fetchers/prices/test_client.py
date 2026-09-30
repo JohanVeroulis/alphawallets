@@ -168,6 +168,44 @@ class TestFetchChartChunk:
         assert point["decimals"] is None
         assert point["confidence"] is None
 
+    def test_point_with_null_timestamp_dropped(self):
+        """fetch_chart sorts and dedupes on timestamp, so a null must not pass through."""
+        body = {
+            "coins": {
+                CID: {
+                    "symbol": "UNI",
+                    "decimals": 18,
+                    "confidence": 0.99,
+                    "prices": [
+                        {"timestamp": 1_790_000_000, "price": 8.0},
+                        {"timestamp": None, "price": 8.5},
+                        {"price": 9.0},  # missing entirely
+                    ],
+                }
+            }
+        }
+        client = _client(_response(200, body))
+        points = fetch_chart_chunk(client, "ethereum", UNI, span=3)
+        assert len(points) == 1
+        assert points[0]["timestamp"] == 1_790_000_000
+
+    def test_point_with_missing_price_kept_for_mapper(self):
+        """Price validation belongs to the mapper, not this layer."""
+        body = {
+            "coins": {
+                CID: {
+                    "symbol": "UNI",
+                    "decimals": 18,
+                    "confidence": 0.99,
+                    "prices": [{"timestamp": 1_790_000_000}],
+                }
+            }
+        }
+        client = _client(_response(200, body))
+        points = fetch_chart_chunk(client, "ethereum", UNI, span=1)
+        assert len(points) == 1
+        assert points[0]["price"] is None
+
     def test_server_error_is_raised_after_retries(self):
         client = _client(*[_response(500, {"message": "boom"}) for _ in range(3)])
         with pytest.raises(httpx.HTTPStatusError):
