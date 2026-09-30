@@ -17,8 +17,9 @@ Primary key: (chain, unique_id) on BOTH tables.
     would not collide with the existing row. Acceptable while Alchemy is the
     sole V1 source (ADR 0003); revisit if a second provider lands.
 
-log_index is kept as a regular nullable column (indexed) so rows can still be
-joined to raw event logs when Alchemy does supply it.
+log_index is kept as a regular nullable column so rows can still be joined to
+raw event logs when Alchemy does supply it. It carries no index — see
+create_tables for why.
 
 Idempotency: INSERT OR IGNORE, same as AW_01 — safe to re-run overlapping
 block ranges.
@@ -78,24 +79,17 @@ CREATE TABLE IF NOT EXISTS erc20_transfer (
 );
 """
 
-# Secondary indexes. log_index supports joins to raw event logs; the address
-# and timestamp indexes serve the wallet-activity and PnL queries that Week 3
-# will run against this table.
-INDEX_DDL = (
-    "CREATE INDEX IF NOT EXISTS idx_erc20_transfer_log_index "
-    "ON erc20_transfer (chain, tx_hash, log_index);",
-    "CREATE INDEX IF NOT EXISTS idx_erc20_transfer_from ON erc20_transfer (from_addr);",
-    "CREATE INDEX IF NOT EXISTS idx_erc20_transfer_to ON erc20_transfer (to_addr);",
-    "CREATE INDEX IF NOT EXISTS idx_erc20_transfer_block_ts ON erc20_transfer (block_timestamp);",
-)
-
 
 def create_tables(conn: DuckDBPyConnection) -> None:
-    """Create both tables and their indexes if absent. Safe to call every run."""
+    """Create both tables if they don't already exist. Safe to call every run.
+
+    No secondary indexes: DuckDB's planner chose SEQ_SCAN over every index we
+    tried at V1 row counts (measured on 50k rows, including the composite
+    (chain, tx_hash, log_index) candidate). PRIMARY KEY uniqueness is enforced
+    automatically and is unaffected.
+    """
     conn.execute(RAW_TABLE_DDL)
     conn.execute(DECODED_TABLE_DDL)
-    for statement in INDEX_DDL:
-        conn.execute(statement)
 
 
 # ---------- Writes ----------
