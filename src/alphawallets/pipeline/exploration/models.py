@@ -149,30 +149,46 @@ class Event(BaseModel):
 def classify_price_status(
     event_hour: datetime,
     has_price_row: bool,
-    now_utc: datetime | None = None,
+    price_grid_head: datetime | None,
 ) -> PriceStatus:
-    """Decide whether an unpriced event is a lag or a gap.
+    """Decide whether an unpriced event is provider lag or a real backfill hole.
 
-    The price grid is hour-aligned and trails the chain head: DefiLlama publishes
-    an hour's point after that hour, so events in the hour currently in progress
-    have no price row yet and will get one on the next backfill. Any earlier hour
-    without a price row is a genuine hole in the backfill.
+    Keyed off the price grid's own head — MAX(token_price.ts) for that
+    (chain, token) — rather than the wall clock. The first live run showed why:
+    AW_03 ran at 06:30Z and its newest point was 05:00Z, so DefiLlama's
+    publishing lag is around two hours, not "the current incomplete hour". A
+    wall-clock rule therefore reported hour 06 as a backfill hole at 07:08Z and
+    told the operator to re-run AW_03, which could not have helped — the data did
+    not exist upstream yet.
+
+    Against the grid head instead:
+
+    - An hour above the head is 'pending'. The backfill has simply not reached it,
+      whether because the provider has not published it or because AW_03 has not
+      run since. Either way the fix is time or a re-run, not investigation.
+    - An hour at or below the head with no row is 'unavailable': a genuine hole
+      inside the range we believe we cover, which is worth investigating.
+
+    The result depends only on data in the cache, so consecutive runs agree
+    without the wall clock drifting between them.
 
     Args:
         event_hour: The event's timestamp truncated to the hour, UTC.
         has_price_row: Whether token_price had a row for that hour.
-        now_utc: Current time, injectable so tests are deterministic. Defaults to
-            datetime.now(UTC).
+        price_grid_head: Newest priced hour for this (chain, token), or None when
+            the token has no prices at all.
 
     Returns:
-        'priced' when a price exists, 'pending' for the current incomplete hour,
-        'unavailable' for a past hour with no price.
+        'priced', 'pending', or 'unavailable'.
     """
     if has_price_row:
         return "priced"
 
-    reference = now_utc if now_utc is not None else datetime.now(tz=UTC)
-    current_hour = reference.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
-    if event_hour.astimezone(UTC) >= current_hour:
+    # No prices at all for this token: nothing is a hole, because there is no
+    # covered range to have a hole in. Everything is simply not backfilled yet.
+    if price_grid_head is None:
+        return "pending"
+
+    if event_hour.astimezone(UTC) > price_grid_head.astimezone(UTC):
         return "pending"
     return "unavailable"

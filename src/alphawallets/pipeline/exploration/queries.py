@@ -161,24 +161,52 @@ WHERE chain = ?
 # Which wallet had the most rows across both tables, used when no --wallet is
 # given. UNION ALL then aggregate, so a wallet that both swapped and transferred
 # ranks above one that only did one of them.
+# Which wallet to show when no --wallet is given.
+#
+# Not ORDER BY COUNT(*). Swaps and transfers live in different address spaces:
+# a swap is keyed on tx_from, the EOA that submitted the transaction, while a
+# transfer is keyed on from_addr/to_addr, the token-level participants — which for
+# a router-mediated swap are the pool and the router, not the EOA. Measured on the
+# live cache on 2026-10-01: 33 distinct UNI/WETH swappers, 469 distinct transfer
+# participants, only 8 addresses in both. Ranking by raw row count therefore picks
+# a high-traffic contract (the first live run chose one with 238 transfers and zero
+# swaps), and such an address almost never has swaps — so the three-way join the
+# module exists to demonstrate never appeared in the output.
+#
+# Wallets present in both tables are ranked first, even with far less activity.
 TOP_WALLET_SQL = """
-WITH activity AS (
-    SELECT lower(tx_from) AS wallet
+WITH swaps AS (
+    SELECT lower(tx_from) AS wallet, COUNT(*) AS n
     FROM uniswap_v3_swap
     WHERE chain = ? AND lower(pool_address) IN ({pool_placeholders})
-    UNION ALL
-    SELECT lower(from_addr) AS wallet
-    FROM erc20_transfer
-    WHERE chain = ? AND lower(token_address) = ?
-    UNION ALL
-    SELECT lower(to_addr) AS wallet
-    FROM erc20_transfer
-    WHERE chain = ? AND lower(token_address) = ?
+    GROUP BY 1
+),
+transfers AS (
+    SELECT wallet, COUNT(*) AS n FROM (
+        SELECT lower(from_addr) AS wallet
+        FROM erc20_transfer
+        WHERE chain = ? AND lower(token_address) = ?
+        UNION ALL
+        SELECT lower(to_addr) AS wallet
+        FROM erc20_transfer
+        WHERE chain = ? AND lower(token_address) = ?
+    )
+    GROUP BY 1
+),
+combined AS (
+    SELECT
+        COALESCE(s.wallet, t.wallet) AS wallet,
+        COALESCE(s.n, 0) AS swap_count,
+        COALESCE(t.n, 0) AS transfer_count
+    FROM swaps s
+    FULL OUTER JOIN transfers t ON s.wallet = t.wallet
 )
-SELECT wallet, COUNT(*) AS n
-FROM activity
-GROUP BY wallet
-ORDER BY n DESC, wallet ASC
+SELECT wallet, swap_count, transfer_count
+FROM combined
+ORDER BY
+    (swap_count > 0 AND transfer_count > 0) DESC,
+    swap_count + transfer_count DESC,
+    wallet
 LIMIT 1
 """
 
@@ -315,6 +343,29 @@ def query_prices_for_hours(
     return {ts.astimezone(UTC): float(price) for ts, price in rows}
 
 
+GRID_HEAD_SQL = """
+SELECT MAX(ts)
+FROM token_price
+WHERE chain = ? AND lower(token_address) = ?
+"""
+
+
+def query_price_grid_head(
+    conn: DuckDBPyConnection,
+    chain: str,
+    token_address: str,
+) -> datetime | None:
+    """Return the newest priced hour for a (chain, token), or None if unpriced.
+
+    The reference point for classify_price_status: above it the backfill simply
+    has not arrived, at or below it a missing hour is a real hole.
+    """
+    row = conn.execute(GRID_HEAD_SQL, [chain, token_address.lower()]).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return row[0].astimezone(UTC)
+
+
 def query_most_active_wallet(
     conn: DuckDBPyConnection,
     chain: str,
@@ -358,7 +409,7 @@ def assemble_timeline(
     swaps: list[dict[str, Any]],
     transfers: list[dict[str, Any]],
     prices_by_hour: dict[datetime, float],
-    now_utc: datetime | None = None,
+    price_grid_head: datetime | None = None,
 ) -> list[Event]:
     """Turn raw query results into one chronological, priced Event list.
 
@@ -366,7 +417,8 @@ def assemble_timeline(
         swaps: Rows from query_wallet_swaps.
         transfers: Rows from query_wallet_transfers.
         prices_by_hour: Mapping from query_prices_for_hours.
-        now_utc: Current time, injectable for deterministic tests.
+        price_grid_head: Newest priced hour for this (chain, token), from
+            query_price_grid_head. None means the token has no prices at all.
 
     Returns:
         Events sorted by timestamp, each classified priced / pending /
@@ -383,7 +435,7 @@ def assemble_timeline(
                 amount_token=swap["amount_token"],
                 tx_hash=swap["tx_hash"],
                 prices_by_hour=prices_by_hour,
-                now_utc=now_utc,
+                price_grid_head=price_grid_head,
                 other_amount=swap["other_amount"],
                 other_token=swap["other_token"],
             )
@@ -398,8 +450,9 @@ def assemble_timeline(
                 amount_token=transfer["amount_token"],
                 tx_hash=transfer["tx_hash"],
                 prices_by_hour=prices_by_hour,
-                now_utc=now_utc,
+                price_grid_head=price_grid_head,
                 counterparty=transfer["counterparty"],
+                amount_approximate=transfer["decimals_assumed"],
             )
         )
 
@@ -416,13 +469,15 @@ def _build_event(
     amount_token: Decimal,
     tx_hash: str,
     prices_by_hour: dict[datetime, float],
-    now_utc: datetime | None,
+    price_grid_head: datetime | None,
     **extra: Any,
 ) -> Event:
     """Build one Event, resolving its price and status from the hour grid."""
     hour = hour_of(ts)
     price = prices_by_hour.get(hour)
-    status = classify_price_status(hour, has_price_row=price is not None, now_utc=now_utc)
+    status = classify_price_status(
+        hour, has_price_row=price is not None, price_grid_head=price_grid_head
+    )
     return Event(
         ts=ts,
         event_type=event_type,

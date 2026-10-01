@@ -28,16 +28,16 @@ from alphawallets.pipeline.exploration.wallet_activity_proof import (
     summarise,
 )
 
+from .conftest import GRID_HEAD as FIXTURE_HEAD
 from .conftest import H05 as FIXTURE_H05
-from .conftest import H06 as FIXTURE_H06
-from .conftest import NOW as FIXTURE_NOW
+from .conftest import H07 as FIXTURE_H07
 from .conftest import UNI, WALLET
 
 # A fixed "now" so nothing in these tests depends on when they run. 06:38Z sits
 # inside hour 06:00, mirroring the first live run where the newest price row was
 # 05:00Z and seven swaps in hour 06 were pending.
-NOW = datetime(2026, 10, 1, 6, 38, 11, tzinfo=UTC)
-CURRENT_HOUR = datetime(2026, 10, 1, 6, 0, 0, tzinfo=UTC)
+# The price grid's newest hour, and an hour comfortably inside the covered range.
+HEAD = datetime(2026, 10, 1, 6, 0, 0, tzinfo=UTC)
 PAST_HOUR = datetime(2026, 10, 1, 5, 0, 0, tzinfo=UTC)
 
 TX = "0x" + "a" * 64
@@ -169,47 +169,66 @@ class TestCoherenceInvariants:
 
 
 class TestClassifyPriceStatus:
-    """The three-state split that keeps a structural lag from reading as a gap."""
+    """The three-state split, keyed off the price grid's head.
+
+    Keyed off MAX(token_price.ts) rather than the wall clock: the first live run
+    showed AW_03 publishing 05:00Z at 06:30Z, so the provider runs about two hours
+    behind and a wall-clock rule reported that lag as a backfill hole.
+    """
 
     def test_price_row_present_is_priced(self):
-        assert classify_price_status(PAST_HOUR, has_price_row=True, now_utc=NOW) == "priced"
-
-    def test_current_hour_without_price_is_pending(self):
-        assert classify_price_status(CURRENT_HOUR, has_price_row=False, now_utc=NOW) == "pending"
-
-    def test_past_hour_without_price_is_unavailable(self):
-        assert classify_price_status(PAST_HOUR, has_price_row=False, now_utc=NOW) == "unavailable"
-
-    def test_current_hour_with_price_is_priced(self):
-        """Once the grid catches up, the same hour is simply priced."""
-        assert classify_price_status(CURRENT_HOUR, has_price_row=True, now_utc=NOW) == "priced"
-
-    def test_future_hour_is_pending_not_unavailable(self):
-        """Clock skew between the node and this host must not read as a gap."""
-        future = CURRENT_HOUR + timedelta(hours=1)
-        assert classify_price_status(future, has_price_row=False, now_utc=NOW) == "pending"
-
-    def test_hour_boundary_exactly_at_current_hour_start(self):
         assert (
-            classify_price_status(CURRENT_HOUR, has_price_row=False, now_utc=CURRENT_HOUR)
-            == "pending"
+            classify_price_status(PAST_HOUR, has_price_row=True, price_grid_head=HEAD) == "priced"
         )
 
-    def test_one_second_before_current_hour_is_unavailable(self):
-        """The boundary is the hour, not the minute — 05:59:59 belongs to hour 05."""
-        just_before = CURRENT_HOUR - timedelta(hours=1)
-        assert classify_price_status(just_before, has_price_row=False, now_utc=NOW) == "unavailable"
+    def test_hour_above_the_head_is_pending(self):
+        above = HEAD + timedelta(hours=1)
+        assert classify_price_status(above, has_price_row=False, price_grid_head=HEAD) == "pending"
 
-    def test_now_utc_defaults_to_wall_clock(self):
-        """Omitting now_utc must still classify, using the real clock."""
-        long_ago = datetime(2020, 1, 1, tzinfo=UTC)
-        assert classify_price_status(long_ago, has_price_row=False) == "unavailable"
-
-    def test_non_utc_now_is_converted(self):
-        """A caller passing a non-UTC aware datetime must not shift the boundary."""
-        kolkata_now = NOW.astimezone(ZoneInfo("Asia/Kolkata"))
+    def test_hour_below_the_head_is_unavailable(self):
+        """A hole inside the range we believe we cover — worth investigating."""
+        below = HEAD - timedelta(hours=2)
         assert (
-            classify_price_status(CURRENT_HOUR, has_price_row=False, now_utc=kolkata_now)
+            classify_price_status(below, has_price_row=False, price_grid_head=HEAD) == "unavailable"
+        )
+
+    def test_hour_equal_to_the_head_without_a_row_is_unavailable(self):
+        """The boundary is inclusive: the head hour is inside the covered range."""
+        assert (
+            classify_price_status(HEAD, has_price_row=False, price_grid_head=HEAD) == "unavailable"
+        )
+
+    def test_no_prices_at_all_is_pending_not_unavailable(self):
+        """Nothing can be a hole when there is no covered range to hole."""
+        assert (
+            classify_price_status(PAST_HOUR, has_price_row=False, price_grid_head=None) == "pending"
+        )
+
+    def test_no_prices_at_all_never_raises(self):
+        """An unpriced token is an actionable state, not an error."""
+        for hour in (PAST_HOUR, HEAD, HEAD + timedelta(hours=5)):
+            assert classify_price_status(hour, has_price_row=False, price_grid_head=None) == (
+                "pending"
+            )
+
+    def test_priced_wins_even_above_the_head(self):
+        """has_price_row is authoritative; the head is only for the unpriced case."""
+        above = HEAD + timedelta(hours=1)
+        assert classify_price_status(above, has_price_row=True, price_grid_head=HEAD) == "priced"
+
+    def test_non_utc_head_is_converted(self):
+        """A +05:30 head must not shift the boundary."""
+        kolkata_head = HEAD.astimezone(ZoneInfo("Asia/Kolkata"))
+        below = HEAD - timedelta(hours=1)
+        assert (
+            classify_price_status(below, has_price_row=False, price_grid_head=kolkata_head)
+            == "unavailable"
+        )
+
+    def test_non_utc_event_hour_is_converted(self):
+        kolkata_hour = (HEAD + timedelta(hours=1)).astimezone(ZoneInfo("Asia/Kolkata"))
+        assert (
+            classify_price_status(kolkata_hour, has_price_row=False, price_grid_head=HEAD)
             == "pending"
         )
 
@@ -226,7 +245,7 @@ class TestTimelineSummary:
         summary = TimelineSummary(
             total=10, swaps=4, transfers=6, priced=7, pending=3, unavailable=0
         )
-        assert summary.complete_hour_events == 7
+        assert summary.covered_range_events == 7
         assert summary.coverage_pct == 100.0
         assert summary.is_fully_priced is True
 
@@ -236,70 +255,100 @@ class TestTimelineSummary:
             summary.priced = 99
 
     def test_pending_excluded_from_the_denominator(self):
-        """The whole point: a structural lag must not read as falling coverage."""
+        """The whole point: provider lag must not read as falling coverage."""
         summary = TimelineSummary(
             total=50, swaps=50, transfers=0, priced=43, pending=7, unavailable=0
         )
-        assert summary.complete_hour_events == 43
+        assert summary.covered_range_events == 43
         assert summary.coverage_pct == 100.0
         assert summary.is_fully_priced is True
 
     def test_unavailable_breaks_full_pricing(self):
-        """A single past-hour gap is a real signal and must not be swallowed."""
+        """A single hole inside the covered range is a real signal."""
         summary = TimelineSummary(
             total=50, swaps=50, transfers=0, priced=42, pending=7, unavailable=1
         )
-        assert summary.complete_hour_events == 43
+        assert summary.covered_range_events == 43
         assert summary.coverage_pct == pytest.approx(97.67, abs=0.01)
         assert summary.is_fully_priced is False
 
     def test_all_pending_is_not_a_division_by_zero(self):
         summary = TimelineSummary(total=3, swaps=0, transfers=3, priced=0, pending=3, unavailable=0)
-        assert summary.complete_hour_events == 0
+        assert summary.covered_range_events == 0
         assert summary.coverage_pct == 100.0
 
     def test_negative_counters_rejected(self):
         with pytest.raises(ValidationError):
             TimelineSummary(total=1, swaps=1, transfers=0, priced=-1, pending=0, unavailable=0)
 
-    def test_unavailable_hours_defaults_to_empty_list(self):
+    def test_hour_lists_default_to_empty(self):
         summary = TimelineSummary(total=0, swaps=0, transfers=0, priced=0, pending=0, unavailable=0)
         assert summary.unavailable_hours == []
+        assert summary.pending_hours == []
+        assert summary.price_grid_head is None
 
 
 class TestSummarise:
     def test_counts_by_type_and_status(self, cache):
-        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW)
-        assert summary.total == len(events) == 5
-        assert (summary.swaps, summary.transfers) == (2, 3)
-        assert (summary.priced, summary.pending, summary.unavailable) == (2, 1, 2)
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert summary.total == len(events) == 6
+        assert (summary.swaps, summary.transfers) == (2, 4)
+        assert (summary.priced, summary.pending, summary.unavailable) == (3, 1, 2)
 
-    def test_pending_hour_is_the_current_hour(self, cache):
-        _events, summary = build_wallet_timeline(
-            cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW
-        )
-        assert summary.pending_hour == FIXTURE_H06
+    def test_grid_head_recorded(self, cache):
+        """The fixture prices hours 03, 04 and 06, so the head is 06:00Z."""
+        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert summary.price_grid_head == FIXTURE_HEAD
 
-    def test_unavailable_hours_lists_the_gap(self, cache):
-        """Both hour-05 events share one hour, so the list is deduplicated."""
-        _events, summary = build_wallet_timeline(
-            cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW
-        )
+    def test_pending_hours_are_above_the_head(self, cache):
+        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert summary.pending_hours == [FIXTURE_H07]
+        assert all(h > summary.price_grid_head for h in summary.pending_hours)
+
+    def test_unavailable_hours_are_inside_the_covered_range(self, cache):
+        """Hour 05 is a hole between priced hours 04 and 06 — a real gap."""
+        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         assert summary.unavailable_hours == [FIXTURE_H05]
+        assert all(h <= summary.price_grid_head for h in summary.unavailable_hours)
 
-    def test_pending_hour_is_none_when_nothing_pending(self, cache):
-        """Advance the clock past every event: nothing is in the current hour."""
-        later = FIXTURE_NOW + timedelta(hours=5)
-        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=later)
-        assert summary.pending == 0
-        assert summary.pending_hour is None
+    def test_grid_head_advance_prices_the_pending_event(self, cache):
+        """Simulate an AW_03 re-run: the pending hour gains a price row.
 
-    def test_pending_becomes_unavailable_once_its_hour_closes(self, cache):
-        """Same data, later clock: the hour-06 event is now a real gap."""
-        later = FIXTURE_NOW + timedelta(hours=5)
-        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=later)
-        assert summary.unavailable == 3
-        assert FIXTURE_H06 in summary.unavailable_hours
+        Stronger than advancing a clock — this is the actual event that resolves
+        a pending event, and the classification follows the data rather than time.
+        """
+        _events, before = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert (before.priced, before.pending) == (3, 1)
+
+        cache.execute(
+            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", UNI, FIXTURE_H07, 8.96, 0.99, "defillama", FIXTURE_H07],
+        )
+
+        _events, after = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert after.price_grid_head == FIXTURE_H07
+        assert (after.priced, after.pending) == (4, 0)
+        assert after.unavailable == 2  # the hour-05 hole is untouched
+
+    def test_filling_the_hole_reaches_full_pricing(self, cache):
+        """The other direction: patching hour 05 clears the unavailable bucket."""
+        cache.execute(
+            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", UNI, FIXTURE_H05, 8.93, 0.99, "defillama", FIXTURE_H05],
+        )
+        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert summary.unavailable == 0
+        assert summary.is_fully_priced is True
+        assert summary.coverage_pct == 100.0
+
+    def test_no_prices_at_all_makes_everything_pending(self, cache):
+        """Empty price table: pending, never unavailable, and never an exception."""
+        cache.execute("DELETE FROM token_price")
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert summary.price_grid_head is None
+        assert summary.pending == len(events) == 6
+        assert summary.unavailable == 0
+        assert summary.coverage_pct == 100.0
 
     def test_empty_timeline_summarises_cleanly(self):
         summary = summarise([])
@@ -310,45 +359,39 @@ class TestSummarise:
 
 class TestBuildWalletTimeline:
     def test_returns_events_and_summary(self, cache):
-        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW)
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         assert isinstance(summary, TimelineSummary)
         assert all(isinstance(e, Event) for e in events)
 
     def test_chronological(self, cache):
-        events, _summary = build_wallet_timeline(
-            cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW
-        )
+        events, _summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         assert [e.ts for e in events] == sorted(e.ts for e in events)
 
     def test_uppercase_wallet_matches(self, cache):
-        lower, _ = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW)
-        upper, _ = build_wallet_timeline(
-            cache, WALLET.upper(), "ethereum", UNI, now_utc=FIXTURE_NOW
-        )
+        lower, _ = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        upper, _ = build_wallet_timeline(cache, WALLET.upper(), "ethereum", UNI)
         assert [e.tx_hash for e in upper] == [e.tx_hash for e in lower]
 
     def test_base_chain_sees_only_base_rows(self, cache):
         """The fixture's one Base row — proof the chain filter reaches this layer."""
-        events, summary = build_wallet_timeline(cache, WALLET, "base", UNI, now_utc=FIXTURE_NOW)
+        events, summary = build_wallet_timeline(cache, WALLET, "base", UNI)
         assert summary.total == 1
         assert events[0].event_type == "transfer"
 
     def test_unknown_wallet_is_empty_not_an_error(self, cache):
-        events, summary = build_wallet_timeline(
-            cache, "0x" + "c" * 40, "ethereum", UNI, now_utc=FIXTURE_NOW
-        )
+        events, summary = build_wallet_timeline(cache, "0x" + "c" * 40, "ethereum", UNI)
         assert events == []
         assert summary.total == 0
 
     def test_defaults_to_ethereum_and_uni(self, cache):
-        events, _summary = build_wallet_timeline(cache, WALLET, now_utc=FIXTURE_NOW)
-        assert len(events) == 5
+        events, _summary = build_wallet_timeline(cache, WALLET)
+        assert len(events) == 6
 
 
 class TestFormatting:
     @pytest.fixture
     def rendered(self, cache):
-        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW)
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         return format_timeline(events, summary, WALLET, "ethereum", UNI)
 
     def test_header_shows_shortened_wallet_and_token(self, rendered):
@@ -356,25 +399,39 @@ class TestFormatting:
         assert "Token: UNI (0x1f98...f984)" in rendered
 
     def test_event_counts_line(self, rendered):
-        assert "Events: 5 (2 swaps, 3 transfers)" in rendered
+        assert "Events: 6 (2 swaps, 4 transfers)" in rendered
 
-    def test_coverage_line_names_complete_hour_denominator(self, rendered):
-        assert "Priced: 2/4 complete-hour events (50%)" in rendered
+    def test_coverage_line_names_covered_range_denominator(self, rendered):
+        assert "Priced: 3/5 covered-range events (60%)" in rendered
 
-    def test_coverage_line_labels_the_pending_hour(self, rendered):
-        assert "Pending: 1 (current hour 2026-10-01 06:00Z)" in rendered
+    def test_coverage_line_lists_pending_hours(self, rendered):
+        assert "Pending: 1 [2026-10-01 07:00Z]" in rendered
+
+    def test_grid_head_is_shown(self, rendered):
+        """The reference point for the whole classification must be visible."""
+        assert "Price grid head: 2026-10-01 06:00Z" in rendered
 
     def test_coverage_line_lists_unavailable_hours(self, rendered):
         assert "Unavailable: 2 [2026-10-01 05:00Z]" in rendered
 
     def test_pending_note_explains_why(self, rendered):
         """The proof must read honestly without this chat for context."""
-        assert "pending, not missing" in rendered
-        assert "next prices backfill will price them" in rendered
+        assert "above the price grid head" in rendered
+        assert "provider's publishing lag" in rendered
+        assert "two hours behind" in rendered
 
     def test_unavailable_warning_names_the_remedy(self, rendered):
-        assert "real gap" in rendered
+        assert "real hole inside the range we cover" in rendered
         assert "Re-run AW_03" in rendered
+
+    def test_unpriced_token_note_is_actionable(self, cache):
+        """No prices at all gets its own message, not the lag explanation."""
+        cache.execute("DELETE FROM token_price")
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        rendered = format_timeline(events, summary, WALLET, "ethereum", UNI)
+        assert "no prices exist for this chain and token" in rendered
+        assert "Run AW_03 for this token" in rendered
+        assert "none — this token has no prices in the cache" in rendered
 
     def test_priced_row_shows_price_and_value(self, rendered):
         assert "@ $8.87" in rendered
@@ -393,9 +450,7 @@ class TestFormatting:
         assert "(-> 1.50 WETH)" in rendered
 
     def test_every_event_has_a_line(self, cache, rendered):
-        events, _summary = build_wallet_timeline(
-            cache, WALLET, "ethereum", UNI, now_utc=FIXTURE_NOW
-        )
+        events, _summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         for event in events:
             assert event.ts.strftime("%H:%MZ") in rendered
 
@@ -429,11 +484,15 @@ class TestFormatting:
         assert "(no events)" in rendered
 
     def test_no_pending_note_when_nothing_pending(self, cache):
-        later = FIXTURE_NOW + timedelta(hours=5)
-        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI, now_utc=later)
+        """Price the hour above the head, and the lag note disappears."""
+        cache.execute(
+            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", UNI, FIXTURE_H07, 8.96, 0.99, "defillama", FIXTURE_H07],
+        )
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         rendered = format_timeline(events, summary, WALLET, "ethereum", UNI)
-        assert "Pending: 0 (none)" in rendered
-        assert "pending, not missing" not in rendered
+        assert "Pending: 0" in rendered
+        assert "publishing lag" not in rendered
 
 
 class TestArgParser:
@@ -491,7 +550,7 @@ class TestCliMain:
         assert main() == 0
         out = capsys.readouterr().out
         assert "AlphaWallets — Wallet Activity Proof" in out
-        assert "Events: 5" in out
+        assert "Events: 6" in out
 
     def test_auto_pick_runs_without_a_wallet(self, db_path, monkeypatch, capsys):
         monkeypatch.setattr(sys, "argv", ["prog", "--db-path", str(db_path)])

@@ -29,13 +29,16 @@ COUNTERPARTY = "0x" + "3" * 40
 
 WEI = 10**18
 
-# Fixed clock. 06:38Z sits inside hour 06, so hour 06 is the current incomplete
-# hour — the shape of the first live run, where the newest price row was 05:00Z.
-NOW = datetime(2026, 10, 1, 6, 38, 11, tzinfo=UTC)
+# The price grid head for the fixture: prices exist for hours 03, 04 and 06, so
+# the newest priced hour is 06:00Z. Hour 05 is therefore a hole INSIDE the covered
+# range (unavailable) while hour 07 sits above the head (pending). Classification
+# is keyed off this, not off the wall clock, so the fixture is deterministic.
+GRID_HEAD = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
 H03 = datetime(2026, 10, 1, 3, 0, tzinfo=UTC)
 H04 = datetime(2026, 10, 1, 4, 0, tzinfo=UTC)
 H05 = datetime(2026, 10, 1, 5, 0, tzinfo=UTC)
 H06 = datetime(2026, 10, 1, 6, 0, tzinfo=UTC)
+H07 = datetime(2026, 10, 1, 7, 0, tzinfo=UTC)
 
 
 def _tx(n: int) -> str:
@@ -79,9 +82,10 @@ def cache():
     Events belonging to WALLET, all on ethereum, all UNI:
       03:17  swap  SELL 500 UNI  -> 1.5 WETH     (hour 03, priced)
       04:17  transfer IN  1234.56 UNI            (hour 04, priced)
-      05:17  swap  BUY  200 UNI  <- 0.6 WETH     (hour 05, NO price row: unavailable)
+      05:17  swap  BUY  200 UNI  <- 0.6 WETH     (hour 05, hole in range: unavailable)
       05:47  transfer OUT 300 UNI                (hour 05, unavailable)
-      06:17  transfer IN  50 UNI                 (hour 06, current: pending)
+      06:17  transfer IN  50 UNI                 (hour 06, priced — the grid head)
+      07:17  transfer IN  25 UNI                 (hour 07, above the head: pending)
 
     Noise that every filter must exclude: a Base transfer, a WETH transfer, a
     swap by OTHER_WALLET, a swap in an untracked pool, and a Base price row.
@@ -143,7 +147,7 @@ def cache():
         def add_price(ts, price, token=UNI, chain="ethereum"):
             conn.execute(
                 "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [chain, token, ts, price, 0.99, "defillama", NOW],
+                [chain, token, ts, price, 0.99, "defillama", GRID_HEAD],
             )
 
         # --- the wallet's own activity ---
@@ -153,6 +157,7 @@ def cache():
         add_swap(H05 + timedelta(minutes=17), _tx(3), 1, UNI_POOL, -200 * WEI, 6 * 10**17)
         add_transfer(H05 + timedelta(minutes=47), _tx(4), 1, WALLET, COUNTERPARTY, 300 * WEI)
         add_transfer(H06 + timedelta(minutes=17), _tx(5), 1, COUNTERPARTY, WALLET, 50 * WEI)
+        add_transfer(H07 + timedelta(minutes=17), _tx(6), 1, COUNTERPARTY, WALLET, 25 * WEI)
 
         # --- noise ---
         add_transfer(
@@ -167,9 +172,11 @@ def cache():
         add_swap(H04 + timedelta(minutes=33), _tx(13), 1, UNTRACKED_POOL, 1 * WEI, -1)
         add_transfer(H03 + timedelta(minutes=5), _tx(14), 1, COUNTERPARTY, OTHER_WALLET, 2 * WEI)
 
-        # --- prices: hours 03 and 04 only. Hour 05 is a real gap, hour 06 is current.
+        # --- prices: hours 03, 04 and 06. Hour 05 is a hole inside the covered
+        # range (unavailable); hour 07 is above the head (pending).
         add_price(H03, 8.87)
         add_price(H04, 8.91)
+        add_price(H06, 8.94)
         add_price(H05, 99.99, chain="base")  # wrong chain, must not be used
 
         yield conn

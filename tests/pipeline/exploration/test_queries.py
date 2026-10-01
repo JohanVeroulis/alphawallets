@@ -17,6 +17,7 @@ from alphawallets.pipeline.exploration.queries import (
     hour_of,
     pools_holding_token,
     query_most_active_wallet,
+    query_price_grid_head,
     query_prices_for_hours,
     query_wallet_swaps,
     query_wallet_transfers,
@@ -25,12 +26,11 @@ from alphawallets.pipeline.exploration.queries import (
 
 from .conftest import (
     COUNTERPARTY,
+    GRID_HEAD,
     H03,
     H04,
     H05,
     H06,
-    NOW,
-    OTHER_WALLET,
     UNI,
     UNI_POOL,
     UNTRACKED_POOL,
@@ -39,8 +39,6 @@ from .conftest import (
     WALLET,
     WEI,
     WETH,
-    _activity_counts,
-    _expected_most_active,
     _tx,
 )
 
@@ -206,6 +204,7 @@ class TestQueryWalletTransfers:
             (_tx(2), "in"),
             (_tx(4), "out"),
             (_tx(5), "in"),
+            (_tx(6), "in"),
         ]
 
     def test_chain_filter_excludes_base_transfer(self, cache):
@@ -270,6 +269,9 @@ class TestQueryPricesForHours:
         prices = query_prices_for_hours(cache, "ethereum", UNI, {H03, H04})
         assert prices == {H03: 8.87, H04: 8.91}
 
+    def test_grid_head_hour_is_priced(self, cache):
+        assert query_prices_for_hours(cache, "ethereum", UNI, {H06}) == {H06: 8.94}
+
     def test_missing_hour_is_absent_not_none(self, cache):
         """An absent key is the signal; a None value would be indistinguishable
         from a row that exists with no price."""
@@ -294,45 +296,207 @@ class TestQueryPricesForHours:
 
 
 class TestQueryMostActiveWallet:
-    def test_picks_the_busiest_wallet(self, cache):
-        """WALLET has 5 rows; OTHER_WALLET has 2. Higher count wins."""
-        assert query_most_active_wallet(cache, "ethereum", UNI) == WALLET
+    """Overlap-first ranking: wallets present in both tables win.
 
-    def test_counts_swaps_and_transfers_together(self, cache):
-        """Every address that moved the token counts, from both sides of a transfer.
+    Not ORDER BY COUNT(*). Swaps key on tx_from (the submitting EOA) while
+    transfers key on from_addr/to_addr (the token-level participants), and on the
+    live cache those sets barely intersect — 33 swappers, 469 transfer
+    participants, 8 in both. Raw-count ranking picked a contract with 238
+    transfers and zero swaps, so the three-way join never appeared in the output.
+    """
 
-        The expectation is computed from the fixture rather than hardcoded: the
-        busiest address here is the shared counterparty, not the wallet under
-        test, and asserting a guessed winner is how a correct query gets
-        "fixed" into a wrong one.
+    def test_prefers_a_wallet_with_both_over_raw_activity(self):
+        """A 3-swap/5-transfer wallet beats 100 swap-only and 500 transfer-only.
+
+        Pins the intent, not the tiebreak: the module exists to show the join, so
+        a wallet that cannot demonstrate it is the wrong answer however busy.
         """
-        expected = _expected_most_active(cache)
-        assert query_most_active_wallet(cache, "ethereum", UNI) == expected
-        # Sanity-check the fixture still exercises a real contest.
-        assert _activity_counts(cache)[expected] > 1
+        swap_only = "0x" + "a" * 40
+        transfer_only = "0x" + "b" * 40
+        overlap = "0x" + "c" * 40
 
-    def test_a_dedicated_wallet_can_outrank_the_counterparty(self, cache):
-        """Give one wallet enough rows to win outright, and it must be picked."""
-        for i in range(20):
-            cache.execute(
-                "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        with connect(":memory:") as conn:
+            create_swap_tables(conn)
+            create_erc20_tables(conn)
+            create_price_tables(conn)
+
+            def swap(wallet, n_rows, offset):
+                for i in range(n_rows):
+                    conn.execute(
+                        "INSERT INTO uniswap_v3_swap "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            "ethereum",
+                            26094728,
+                            H03 + timedelta(seconds=offset + i),
+                            _tx(offset + i),
+                            1,
+                            UNI_POOL,
+                            wallet,
+                            "0x" + "f" * 40,
+                            "0x" + "e" * 40,
+                            str(WEI),
+                            str(-WEI),
+                            "1",
+                            "2",
+                            1,
+                        ],
+                    )
+
+            def transfer(wallet, n_rows, offset):
+                # A distinct counterparty per row: a shared one would itself
+                # accumulate the highest count and win the ranking.
+                for i in range(n_rows):
+                    conn.execute(
+                        "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        [
+                            "ethereum",
+                            26094728,
+                            H03 + timedelta(seconds=offset + i),
+                            _tx(offset + i),
+                            1,
+                            f"{_tx(offset + i)}:1",
+                            UNI,
+                            wallet,
+                            f"0x{offset + i:040x}",
+                            str(WEI),
+                            18,
+                        ],
+                    )
+
+            swap(swap_only, 100, 1000)
+            transfer(transfer_only, 500, 2000)
+            swap(overlap, 3, 4000)
+            transfer(overlap, 5, 5000)
+
+            assert query_most_active_wallet(conn, "ethereum", UNI) == overlap
+
+    def test_falls_back_to_most_active_when_no_overlap_exists(self):
+        """With nobody in both tables, raw activity decides."""
+        swap_only = "0x" + "a" * 40
+        transfer_only = "0x" + "b" * 40
+
+        with connect(":memory:") as conn:
+            create_swap_tables(conn)
+            create_erc20_tables(conn)
+            create_price_tables(conn)
+            conn.execute(
+                "INSERT INTO uniswap_v3_swap VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     "ethereum",
                     26094728,
-                    H04 + timedelta(seconds=i),
-                    _tx(50 + i),
+                    H03,
+                    _tx(900),
                     1,
-                    f"{_tx(50 + i)}:1",
-                    UNI,
-                    OTHER_WALLET,
-                    "0x" + "4" * 40,
+                    UNI_POOL,
+                    swap_only,
+                    "0x" + "f" * 40,
+                    "0x" + "e" * 40,
                     str(WEI),
-                    18,
+                    str(-WEI),
+                    "1",
+                    "2",
+                    1,
                 ],
             )
-        counts = _activity_counts(cache)
-        assert counts[OTHER_WALLET] == max(counts.values())
-        assert query_most_active_wallet(cache, "ethereum", UNI) == OTHER_WALLET
+            # A distinct counterparty per row, so transfer_only is the only
+            # address accumulating a count — otherwise a shared counterparty ties
+            # with it and wins on the address tiebreak.
+            for i in range(5):
+                conn.execute(
+                    "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        "ethereum",
+                        26094728,
+                        H03 + timedelta(seconds=i),
+                        _tx(910 + i),
+                        1,
+                        f"{_tx(910 + i)}:1",
+                        UNI,
+                        transfer_only,
+                        f"0x{i:040x}",
+                        str(WEI),
+                        18,
+                    ],
+                )
+            assert query_most_active_wallet(conn, "ethereum", UNI) == transfer_only
+
+    def test_swap_only_wallet_can_win_when_it_is_all_there_is(self):
+        swap_only = "0x" + "a" * 40
+        with connect(":memory:") as conn:
+            create_swap_tables(conn)
+            create_erc20_tables(conn)
+            create_price_tables(conn)
+            conn.execute(
+                "INSERT INTO uniswap_v3_swap VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    "ethereum",
+                    26094728,
+                    H03,
+                    _tx(900),
+                    1,
+                    UNI_POOL,
+                    swap_only,
+                    "0x" + "f" * 40,
+                    "0x" + "e" * 40,
+                    str(WEI),
+                    str(-WEI),
+                    "1",
+                    "2",
+                    1,
+                ],
+            )
+            assert query_most_active_wallet(conn, "ethereum", UNI) == swap_only
+
+    def test_tie_broken_deterministically_by_address(self):
+        """Two identical overlap wallets must not alternate between runs."""
+        low = "0x" + "1" * 40
+        high = "0x" + "e" * 40
+        with connect(":memory:") as conn:
+            create_swap_tables(conn)
+            create_erc20_tables(conn)
+            create_price_tables(conn)
+            for i, wallet in enumerate((high, low)):
+                conn.execute(
+                    "INSERT INTO uniswap_v3_swap VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        "ethereum",
+                        26094728,
+                        H03 + timedelta(seconds=i),
+                        _tx(800 + i),
+                        1,
+                        UNI_POOL,
+                        wallet,
+                        "0x" + "f" * 40,
+                        "0x" + "e" * 40,
+                        str(WEI),
+                        str(-WEI),
+                        "1",
+                        "2",
+                        1,
+                    ],
+                )
+                conn.execute(
+                    "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        "ethereum",
+                        26094728,
+                        H03 + timedelta(seconds=i),
+                        _tx(820 + i),
+                        1,
+                        f"{_tx(820 + i)}:1",
+                        UNI,
+                        wallet,
+                        COUNTERPARTY,
+                        str(WEI),
+                        18,
+                    ],
+                )
+            assert query_most_active_wallet(conn, "ethereum", UNI) == low
+
+    def test_chain_filter_applies(self, cache):
+        """Base has one transfer in the fixture and no swaps."""
+        assert query_most_active_wallet(cache, "base", UNI) in {WALLET, COUNTERPARTY}
 
     def test_empty_cache_returns_none(self):
         with connect(":memory:") as conn:
@@ -343,6 +507,29 @@ class TestQueryMostActiveWallet:
 
     def test_unknown_token_returns_none(self, cache):
         assert query_most_active_wallet(cache, "ethereum", "0x" + "7" * 40) is None
+
+
+class TestQueryPriceGridHead:
+    def test_returns_the_newest_priced_hour(self, cache):
+        assert query_price_grid_head(cache, "ethereum", UNI) == GRID_HEAD
+
+    def test_none_when_the_token_has_no_prices(self, cache):
+        assert query_price_grid_head(cache, "ethereum", WETH) is None
+
+    def test_none_when_the_table_is_empty(self, cache):
+        cache.execute("DELETE FROM token_price")
+        assert query_price_grid_head(cache, "ethereum", UNI) is None
+
+    def test_scoped_per_chain(self, cache):
+        """The Base row is at hour 05; Ethereum's head is 06. They must not mix."""
+        assert query_price_grid_head(cache, "base", UNI) == H05
+
+    def test_uppercase_token_matches(self, cache):
+        assert query_price_grid_head(cache, "ethereum", UNI.upper()) == GRID_HEAD
+
+    def test_result_is_utc(self, cache):
+        head = query_price_grid_head(cache, "ethereum", UNI)
+        assert head.utcoffset().total_seconds() == 0
 
 
 # ---------- Composition ----------
@@ -367,11 +554,11 @@ class TestAssembleTimeline:
         transfers = query_wallet_transfers(cache, WALLET, "ethereum", UNI)
         hours = {hour_of(r["ts"]) for r in [*swaps, *transfers]}
         prices = query_prices_for_hours(cache, "ethereum", UNI, hours)
-        return assemble_timeline(swaps, transfers, prices, now_utc=NOW)
+        return assemble_timeline(swaps, transfers, prices, price_grid_head=GRID_HEAD)
 
     def test_all_events_included(self, timeline):
         """Unpriced events are still events — none may be dropped."""
-        assert len(timeline) == 5
+        assert len(timeline) == 6
 
     def test_chronological_order(self, timeline):
         assert [e.ts for e in timeline] == sorted(e.ts for e in timeline)
@@ -383,14 +570,22 @@ class TestAssembleTimeline:
             "swap",
             "transfer",
             "transfer",
+            "transfer",
         ]
 
     def test_directions(self, timeline):
-        assert [e.direction for e in timeline] == ["sell", "in", "buy", "out", "in"]
+        assert [e.direction for e in timeline] == ["sell", "in", "buy", "out", "in", "in"]
 
     def test_price_status_buckets(self, timeline):
         statuses = [e.price_status for e in timeline]
-        assert statuses == ["priced", "priced", "unavailable", "unavailable", "pending"]
+        assert statuses == [
+            "priced",
+            "priced",
+            "unavailable",
+            "unavailable",
+            "priced",
+            "pending",
+        ]
 
     def test_priced_events_carry_value(self, timeline):
         sell = timeline[0]
@@ -415,7 +610,7 @@ class TestAssembleTimeline:
         priced = sum(1 for e in timeline if e.price_status == "priced")
         pending = sum(1 for e in timeline if e.price_status == "pending")
         unavailable = sum(1 for e in timeline if e.price_status == "unavailable")
-        assert (priced, pending, unavailable) == (2, 1, 2)
+        assert (priced, pending, unavailable) == (3, 1, 2)
         assert priced + pending + unavailable == len(timeline)
 
     def test_swap_carries_paired_leg_transfer_does_not(self, timeline):
@@ -427,7 +622,7 @@ class TestAssembleTimeline:
         assert transfer.counterparty == COUNTERPARTY
 
     def test_empty_inputs_give_empty_timeline(self):
-        assert assemble_timeline([], [], {}, now_utc=NOW) == []
+        assert assemble_timeline([], [], {}, price_grid_head=GRID_HEAD) == []
 
     def test_order_is_stable_for_same_timestamp(self, cache):
         """Two events in one second must not reorder between runs."""
@@ -435,6 +630,6 @@ class TestAssembleTimeline:
         transfers = query_wallet_transfers(cache, WALLET, "ethereum", UNI)
         for transfer in transfers:
             transfer["ts"] = swaps[0]["ts"]
-        first = assemble_timeline(swaps, transfers, {}, now_utc=NOW)
-        second = assemble_timeline(swaps, list(reversed(transfers)), {}, now_utc=NOW)
+        first = assemble_timeline(swaps, transfers, {}, price_grid_head=GRID_HEAD)
+        second = assemble_timeline(swaps, list(reversed(transfers)), {}, price_grid_head=GRID_HEAD)
         assert [e.tx_hash for e in first] == [e.tx_hash for e in second]

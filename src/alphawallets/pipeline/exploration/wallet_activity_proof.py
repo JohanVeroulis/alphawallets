@@ -32,6 +32,7 @@ from alphawallets.pipeline.exploration.queries import (
     assemble_timeline,
     hour_of,
     query_most_active_wallet,
+    query_price_grid_head,
     query_prices_for_hours,
     query_wallet_swaps,
     query_wallet_transfers,
@@ -44,9 +45,9 @@ class TimelineSummary(BaseModel):
     """Counters for one timeline, consumed identically by the CLI and the tests.
 
     Its own model so the coverage arithmetic lives in exactly one place. The
-    denominator for coverage is complete-hour events only — priced plus
-    unavailable — because an event in the hour currently in progress has no price
-    to be missing yet. Including it would report a permanent structural lag as
+    denominator for coverage is covered-range events only — priced plus
+    unavailable — because an event above the price grid's head has no price to be
+    missing yet. Including it would report the provider's publishing lag as
     falling coverage, every run, forever.
     """
 
@@ -57,9 +58,16 @@ class TimelineSummary(BaseModel):
     transfers: int = Field(ge=0)
     priced: int = Field(ge=0)
     pending: int = Field(ge=0, description="Events in the current incomplete hour")
-    unavailable: int = Field(ge=0, description="Events in a past hour with no price row")
-    pending_hour: datetime | None = Field(
-        default=None, description="The current hour, when any event falls inside it"
+    unavailable: int = Field(
+        ge=0, description="Events at or below the grid head with no price row — a real hole"
+    )
+    price_grid_head: datetime | None = Field(
+        default=None,
+        description="Newest priced hour for this (chain, token). None when unpriced",
+    )
+    pending_hours: list[datetime] = Field(
+        default_factory=list,
+        description="Hours above the grid head — the backfill has not reached them",
     )
     unavailable_hours: list[datetime] = Field(
         default_factory=list,
@@ -67,20 +75,20 @@ class TimelineSummary(BaseModel):
     )
 
     @property
-    def complete_hour_events(self) -> int:
-        """Events whose hour has finished, so a price could legitimately exist."""
+    def covered_range_events(self) -> int:
+        """Events at or below the grid head, where a price could legitimately exist."""
         return self.priced + self.unavailable
 
     @property
     def coverage_pct(self) -> float:
-        """Priced share of complete-hour events. 100.0 when there are none."""
-        if self.complete_hour_events == 0:
+        """Priced share of covered-range events. 100.0 when there are none."""
+        if self.covered_range_events == 0:
             return 100.0
-        return 100.0 * self.priced / self.complete_hour_events
+        return 100.0 * self.priced / self.covered_range_events
 
     @property
     def is_fully_priced(self) -> bool:
-        """True when every complete-hour event has a price.
+        """True when every event inside the covered range has a price.
 
         The strict assertion for the live proof: pending is excluded, but a single
         unavailable event makes this False and must fail loudly.
@@ -88,21 +96,24 @@ class TimelineSummary(BaseModel):
         return self.unavailable == 0
 
 
-def summarise(events: list[Event]) -> TimelineSummary:
+def summarise(
+    events: list[Event],
+    price_grid_head: datetime | None = None,
+) -> TimelineSummary:
     """Count a timeline into a TimelineSummary.
 
     Args:
         events: The timeline, in any order.
+        price_grid_head: Newest priced hour for this (chain, token), carried into
+            the summary so the output can explain the pending bucket.
 
     Returns:
-        A frozen summary, with the pending hour and the sorted list of hours that
-        are genuinely missing a price.
+        A frozen summary, with the sorted lists of hours that are pending and of
+        hours that are genuinely missing a price.
     """
     by_status: dict[str, list[Event]] = {"priced": [], "pending": [], "unavailable": []}
     for event in events:
         by_status[event.price_status].append(event)
-
-    pending_hours = {_hour(e.ts) for e in by_status["pending"]}
 
     return TimelineSummary(
         total=len(events),
@@ -111,9 +122,8 @@ def summarise(events: list[Event]) -> TimelineSummary:
         priced=len(by_status["priced"]),
         pending=len(by_status["pending"]),
         unavailable=len(by_status["unavailable"]),
-        # Normally one hour. Taking the max keeps the label honest if a clock skew
-        # ever put two hours in the pending bucket.
-        pending_hour=max(pending_hours) if pending_hours else None,
+        price_grid_head=price_grid_head,
+        pending_hours=sorted({_hour(e.ts) for e in by_status["pending"]}),
         unavailable_hours=sorted({_hour(e.ts) for e in by_status["unavailable"]}),
     )
 
@@ -128,7 +138,6 @@ def build_wallet_timeline(
     wallet_address: str,
     chain: str = "ethereum",
     token_address: str = UNI_ETHEREUM,
-    now_utc: datetime | None = None,
 ) -> tuple[list[Event], TimelineSummary]:
     """Build one wallet's priced timeline for one token from the cache.
 
@@ -140,8 +149,6 @@ def build_wallet_timeline(
         wallet_address: Wallet to inspect, any case.
         chain: Chain name. Only rows on this chain are considered.
         token_address: Token contract, any case.
-        now_utc: Current time, injectable so tests and the pending/unavailable
-            boundary are deterministic.
 
     Returns:
         (events, summary) — the full timeline including unpriced events, and its
@@ -155,8 +162,12 @@ def build_wallet_timeline(
     hours = {hour_of(row["ts"]) for row in [*swaps, *transfers]}
     prices_by_hour = query_prices_for_hours(conn, chain, token_address, hours)
 
-    events = assemble_timeline(swaps, transfers, prices_by_hour, now_utc=now_utc)
-    return events, summarise(events)
+    # The grid's own head is the reference for pending vs unavailable, so the
+    # classification depends on cached data rather than on the wall clock.
+    grid_head = query_price_grid_head(conn, chain, token_address)
+
+    events = assemble_timeline(swaps, transfers, prices_by_hour, price_grid_head=grid_head)
+    return events, summarise(events, price_grid_head=grid_head)
 
 
 # ---------- Output ----------
@@ -178,6 +189,11 @@ def _token_symbol(token_address: str) -> str:
             if layout[slot]["address"] == token:
                 return str(layout[slot]["symbol"])
     return "token"
+
+
+def _hour_label(ts: datetime) -> str:
+    """Render an hour for the summary lines, always in UTC."""
+    return ts.astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
 
 
 def _format_amount(amount: Decimal) -> str:
@@ -237,35 +253,51 @@ def format_timeline(
     ]
 
     coverage = (
-        f"Priced: {summary.priced}/{summary.complete_hour_events} complete-hour events "
+        f"Priced: {summary.priced}/{summary.covered_range_events} covered-range events "
         f"({summary.coverage_pct:.0f}%)"
     )
-    pending_label = (
-        f"current hour {summary.pending_hour.strftime('%Y-%m-%d %H:%MZ')}"
-        if summary.pending_hour is not None
-        else "none"
-    )
-    coverage += f"   Pending: {summary.pending} ({pending_label})"
+    coverage += f"   Pending: {summary.pending}"
+    if summary.pending_hours:
+        hours = ", ".join(_hour_label(h) for h in summary.pending_hours)
+        coverage += f" [{hours}]"
     coverage += f"   Unavailable: {summary.unavailable}"
     if summary.unavailable_hours:
-        hours = ", ".join(h.strftime("%Y-%m-%d %H:%MZ") for h in summary.unavailable_hours)
+        hours = ", ".join(_hour_label(h) for h in summary.unavailable_hours)
         coverage += f" [{hours}]"
     lines.append(coverage)
 
+    head_label = (
+        _hour_label(summary.price_grid_head)
+        if summary.price_grid_head is not None
+        else "none — this token has no prices in the cache"
+    )
+    lines.append(f"Price grid head: {head_label}")
+
     if summary.pending:
-        lines += [
-            "",
-            f"Note: {summary.pending} event(s) fall in {pending_label}, which DefiLlama has "
-            "not published a price for yet.",
-            "      They are pending, not missing — the next prices backfill will price them. "
-            "Coverage above counts complete hours only.",
-        ]
+        if summary.price_grid_head is None:
+            lines += [
+                "",
+                f"Note: all {summary.pending} event(s) are unpriced because no prices exist "
+                "for this chain and token.",
+                "      Run AW_03 for this token, then re-run this proof.",
+            ]
+        else:
+            lines += [
+                "",
+                f"Note: {summary.pending} event(s) fall in hours above the price grid head "
+                f"({head_label}), so no price",
+                "      exists for them yet. That is the provider's publishing lag, not a "
+                "missing backfill — DefiLlama",
+                "      runs roughly two hours behind the chain head. Coverage above counts "
+                "the covered range only.",
+            ]
     if summary.unavailable_hours:
         lines += [
             "",
-            f"Warning: {summary.unavailable} event(s) fall in past hours with no price row. "
-            "That is a real gap in the",
-            "         prices backfill, not a lag. Re-run AW_03 to cover the hours listed above.",
+            f"Warning: {summary.unavailable} event(s) fall in hours at or below the grid "
+            "head with no price row.",
+            "         That is a real hole inside the range we cover, not lag. Re-run AW_03 "
+            "for the hours listed above.",
         ]
 
     lines.append("")
