@@ -22,10 +22,7 @@ from typing import Any
 
 from duckdb import DuckDBPyConnection
 
-from alphawallets.pipeline.exploration.wallet_activity_proof import (
-    Event,
-    classify_price_status,
-)
+from alphawallets.pipeline.exploration.models import Event, classify_price_status
 
 # Which token sits in which slot of each pool we fetch swaps for.
 #

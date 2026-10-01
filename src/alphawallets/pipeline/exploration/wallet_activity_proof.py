@@ -9,168 +9,364 @@ Reads DuckDB only. No Alchemy, no HTTP (CLAUDE.md Section 6): pipeline stages
 work from the cache the fetchers fill, so a stage can be re-run freely and its
 cost is never a provider's rate limit.
 
-Price coverage is three-state, not two. The price grid is hour-aligned and only
-as current as DefiLlama's most recent published hour, so an event in the current
-incomplete hour is legitimately unpriced and will be priced by the next
-backfill. That is "pending", and it is not the same failure as "unavailable" —
-an hour in the past with no price row, which means the backfill has a real gap.
-Measured on the first live run: 43/50 UNI/WETH swaps priced, the other 7 all in
-the current hour. Collapsing those two states would have read as 86% coverage
-with no way to tell a lag from a defect.
+Layering, mirroring the fetchers: models.py holds Event and the price
+classification, queries.py holds the SQL, and this module composes them and
+renders the result.
 """
 
 from __future__ import annotations
 
+import argparse
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal
+from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from duckdb import DuckDBPyConnection
+from pydantic import BaseModel, ConfigDict, Field
 
-# UNI on Ethereum: a tracked DeFi token and a tracked airdrop (CLAUDE.md
-# Section 2), and the only token with swap, transfer and price data in the cache.
-UNI_ETHEREUM = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
+from alphawallets.db import connect
+from alphawallets.pipeline.exploration.models import UNI_ETHEREUM, Event
+from alphawallets.pipeline.exploration.queries import (
+    POOL_TOKEN_LAYOUT,
+    assemble_timeline,
+    hour_of,
+    query_most_active_wallet,
+    query_prices_for_hours,
+    query_wallet_swaps,
+    query_wallet_transfers,
+)
 
-EventType = Literal["swap", "transfer"]
-Direction = Literal["in", "out", "sell", "buy"]
-PriceStatus = Literal["priced", "pending", "unavailable"]
-
-# Which directions each event type is allowed to carry. A transfer moves tokens
-# in or out of the wallet; a swap exchanges them, so it buys or sells.
-_DIRECTIONS_BY_TYPE: dict[str, set[str]] = {
-    "transfer": {"in", "out"},
-    "swap": {"buy", "sell"},
-}
+logger = logging.getLogger(__name__)
 
 
-class Event(BaseModel):
-    """One thing a wallet did with one token, priced where a price exists.
+class TimelineSummary(BaseModel):
+    """Counters for one timeline, consumed identically by the CLI and the tests.
 
-    Frozen, like every model in the project: an event is an observation of
-    something that already happened, and a pipeline stage that rewrites one is a
-    bug rather than a feature.
-
-    Two invariants are enforced here rather than trusted to the query layer,
-    because both would otherwise produce a plausible-looking timeline:
-
-    1. direction must match event_type — a transfer is in/out, a swap is
-       buy/sell. A "swap in" would mean the classification logic crossed wires.
-    2. price_status, price_usd and value_usd must agree. 'priced' requires a
-       price; 'pending' and 'unavailable' require its absence. A row claiming
-       to be priced with no price would inflate coverage silently.
+    Its own model so the coverage arithmetic lives in exactly one place. The
+    denominator for coverage is complete-hour events only — priced plus
+    unavailable — because an event in the hour currently in progress has no price
+    to be missing yet. Including it would report a permanent structural lag as
+    falling coverage, every run, forever.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    ts: datetime = Field(description="Block timestamp, timezone-aware UTC")
-    event_type: EventType
-    direction: Direction
-    amount_token: Decimal = Field(description="Token amount in whole units, decimals applied")
-    price_usd: float | None = Field(
-        default=None, description="USD price for the event's hour, None unless price_status=priced"
+    total: int = Field(ge=0)
+    swaps: int = Field(ge=0)
+    transfers: int = Field(ge=0)
+    priced: int = Field(ge=0)
+    pending: int = Field(ge=0, description="Events in the current incomplete hour")
+    unavailable: int = Field(ge=0, description="Events in a past hour with no price row")
+    pending_hour: datetime | None = Field(
+        default=None, description="The current hour, when any event falls inside it"
     )
-    value_usd: Decimal | None = Field(
-        default=None, description="amount_token * price_usd, None when unpriced"
-    )
-    price_status: PriceStatus
-    tx_hash: str
-    counterparty: str | None = Field(
-        default=None, description="The other address in a transfer. None for swaps"
-    )
-    other_amount: Decimal | None = Field(
-        default=None, description="The paired leg of a swap. None for transfers"
-    )
-    other_token: str | None = Field(
-        default=None, description="Symbol or address of the paired leg. None for transfers"
+    unavailable_hours: list[datetime] = Field(
+        default_factory=list,
+        description="Past hours with no price row — a real gap in the backfill",
     )
 
-    @field_validator("ts")
-    @classmethod
-    def _must_be_utc_aware(cls, v: datetime) -> datetime:
-        """Reject naive timestamps, which compare wrongly against the price grid."""
-        if v.tzinfo is None:
-            raise ValueError("ts must be timezone-aware (UTC)")
-        return v
+    @property
+    def complete_hour_events(self) -> int:
+        """Events whose hour has finished, so a price could legitimately exist."""
+        return self.priced + self.unavailable
 
-    @field_validator("tx_hash", "counterparty")
-    @classmethod
-    def _lowercase_addresses(cls, v: str | None) -> str | None:
-        """Normalise hex to lowercase so comparisons and grouping behave.
+    @property
+    def coverage_pct(self) -> float:
+        """Priced share of complete-hour events. 100.0 when there are none."""
+        if self.complete_hour_events == 0:
+            return 100.0
+        return 100.0 * self.priced / self.complete_hour_events
 
-        The cache stores lowercase throughout, but an Event can also be built in
-        a test or a notebook, and a mixed-case tx_hash would quietly fail to
-        match one read from the DB.
+    @property
+    def is_fully_priced(self) -> bool:
+        """True when every complete-hour event has a price.
+
+        The strict assertion for the live proof: pending is excluded, but a single
+        unavailable event makes this False and must fail loudly.
         """
-        return v.lower() if v is not None else None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _check_coherence(cls, data: Any) -> Any:
-        """Enforce the direction/type and price_status/price agreements.
-
-        Runs in 'before' mode because the model is frozen: this is the last point
-        at which the incoming fields can be inspected together, and value_usd is
-        derived here rather than recomputed by every caller.
-        """
-        if not isinstance(data, dict):
-            return data
-
-        event_type = data.get("event_type")
-        direction = data.get("direction")
-        allowed = _DIRECTIONS_BY_TYPE.get(event_type) if event_type else None
-        if allowed is not None and direction is not None and direction not in allowed:
-            raise ValueError(
-                f"direction {direction!r} is not valid for event_type {event_type!r}; "
-                f"expected one of {sorted(allowed)}"
-            )
-
-        status = data.get("price_status")
-        price = data.get("price_usd")
-        if status == "priced" and price is None:
-            raise ValueError("price_status='priced' requires a price_usd")
-        if status in {"pending", "unavailable"} and price is not None:
-            raise ValueError(
-                f"price_status={status!r} must not carry a price_usd, got {price!r}. "
-                "A priced event is 'priced'; the other two mean no price exists."
-            )
-
-        # Derive value_usd once, here, so no caller has to remember that a
-        # Decimal amount cannot be multiplied by a float price directly.
-        if price is not None and data.get("value_usd") is None:
-            amount = data.get("amount_token")
-            if amount is not None:
-                data["value_usd"] = Decimal(str(amount)) * Decimal(str(price))
-
-        return data
+        return self.unavailable == 0
 
 
-def classify_price_status(
-    event_hour: datetime,
-    has_price_row: bool,
-    now_utc: datetime | None = None,
-) -> PriceStatus:
-    """Decide whether an unpriced event is a lag or a gap.
-
-    The price grid is hour-aligned and trails the chain head: DefiLlama publishes
-    an hour's point after that hour, so events in the hour currently in progress
-    have no price row yet and will get one on the next backfill. Any earlier hour
-    without a price row is a genuine hole in the backfill.
+def summarise(events: list[Event]) -> TimelineSummary:
+    """Count a timeline into a TimelineSummary.
 
     Args:
-        event_hour: The event's timestamp truncated to the hour, UTC.
-        has_price_row: Whether token_price had a row for that hour.
-        now_utc: Current time, injectable so tests are deterministic. Defaults to
-            datetime.now(UTC).
+        events: The timeline, in any order.
 
     Returns:
-        'priced' when a price exists, 'pending' for the current incomplete hour,
-        'unavailable' for a past hour with no price.
+        A frozen summary, with the pending hour and the sorted list of hours that
+        are genuinely missing a price.
     """
-    if has_price_row:
-        return "priced"
+    by_status: dict[str, list[Event]] = {"priced": [], "pending": [], "unavailable": []}
+    for event in events:
+        by_status[event.price_status].append(event)
 
-    reference = now_utc if now_utc is not None else datetime.now(tz=UTC)
-    current_hour = reference.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
-    if event_hour.astimezone(UTC) >= current_hour:
-        return "pending"
-    return "unavailable"
+    pending_hours = {_hour(e.ts) for e in by_status["pending"]}
+
+    return TimelineSummary(
+        total=len(events),
+        swaps=sum(1 for e in events if e.event_type == "swap"),
+        transfers=sum(1 for e in events if e.event_type == "transfer"),
+        priced=len(by_status["priced"]),
+        pending=len(by_status["pending"]),
+        unavailable=len(by_status["unavailable"]),
+        # Normally one hour. Taking the max keeps the label honest if a clock skew
+        # ever put two hours in the pending bucket.
+        pending_hour=max(pending_hours) if pending_hours else None,
+        unavailable_hours=sorted({_hour(e.ts) for e in by_status["unavailable"]}),
+    )
+
+
+def _hour(ts: datetime) -> datetime:
+    """Truncate to the UTC hour. Mirrors queries.hour_of, kept local to avoid a cycle."""
+    return ts.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def build_wallet_timeline(
+    conn: DuckDBPyConnection,
+    wallet_address: str,
+    chain: str = "ethereum",
+    token_address: str = UNI_ETHEREUM,
+    now_utc: datetime | None = None,
+) -> tuple[list[Event], TimelineSummary]:
+    """Build one wallet's priced timeline for one token from the cache.
+
+    Three queries — swaps, transfers, then prices in bulk for exactly the hours
+    those events occupy — composed into a chronological Event list.
+
+    Args:
+        conn: Open DuckDB connection to the cache.
+        wallet_address: Wallet to inspect, any case.
+        chain: Chain name. Only rows on this chain are considered.
+        token_address: Token contract, any case.
+        now_utc: Current time, injectable so tests and the pending/unavailable
+            boundary are deterministic.
+
+    Returns:
+        (events, summary) — the full timeline including unpriced events, and its
+        counters.
+    """
+    swaps = query_wallet_swaps(conn, wallet_address, chain, token_address)
+    transfers = query_wallet_transfers(conn, wallet_address, chain, token_address)
+
+    # Only the hours the events actually occupy, so the price query scales with
+    # activity rather than with the span of the cache.
+    hours = {hour_of(row["ts"]) for row in [*swaps, *transfers]}
+    prices_by_hour = query_prices_for_hours(conn, chain, token_address, hours)
+
+    events = assemble_timeline(swaps, transfers, prices_by_hour, now_utc=now_utc)
+    return events, summarise(events)
+
+
+# ---------- Output ----------
+
+
+def _short(address: str) -> str:
+    """Abbreviate an address for a header line: 0x1234...abcd."""
+    return f"{address[:6]}...{address[-4:]}" if len(address) > 12 else address
+
+
+def _token_symbol(token_address: str) -> str:
+    """Look up a token's symbol from the verified pool layout, or fall back.
+
+    Display only — nothing joins on the symbol.
+    """
+    token = token_address.lower()
+    for layout in POOL_TOKEN_LAYOUT.values():
+        for slot in ("token0", "token1"):
+            if layout[slot]["address"] == token:
+                return str(layout[slot]["symbol"])
+    return "token"
+
+
+def _format_amount(amount: Decimal) -> str:
+    """Thousands-separated, two decimals — readable in a column."""
+    return f"{amount:,.2f}"
+
+
+def format_event_line(event: Event, symbol: str) -> str:
+    """Render one event as a timeline row.
+
+    Unpriced events show why they are unpriced in the price column rather than a
+    blank, so a reader can tell a structural lag from a missing backfill without
+    consulting the summary.
+    """
+    hour_label = event.ts.astimezone(UTC).strftime("%Y-%m-%d %H:%MZ")
+    amount = _format_amount(event.amount_token)
+    approx = " (~)" if event.amount_approximate else ""
+
+    if event.price_status == "priced":
+        assert event.price_usd is not None and event.value_usd is not None
+        price_cell = f"@ ${event.price_usd:,.2f}"
+        value_cell = f"= ${event.value_usd:>12,.2f}"
+    else:
+        price_cell = f"@ {event.price_status}"
+        value_cell = f"= {'--':>13}"
+
+    paired = ""
+    if event.other_amount is not None and event.other_token is not None:
+        paired = f"  (-> {_format_amount(event.other_amount)} {event.other_token})"
+
+    return (
+        f"[{hour_label}]  {event.event_type.upper():<8}  {event.direction.upper():<4}  "
+        f"{amount:>14} {symbol}{approx}  {price_cell:<16} {value_cell}{paired}"
+    )
+
+
+def format_timeline(
+    events: list[Event],
+    summary: TimelineSummary,
+    wallet_address: str,
+    chain: str,
+    token_address: str,
+) -> str:
+    """Render the whole proof: header, counters, then one line per event.
+
+    Written to read honestly to someone who opens the terminal without having
+    read the design discussion — every unpriced event says why, and the summary
+    names the pending hour and any genuinely missing hours.
+    """
+    symbol = _token_symbol(token_address)
+    lines = [
+        "AlphaWallets — Wallet Activity Proof",
+        f"  Wallet: {_short(wallet_address)}",
+        f"  Chain:  {chain}   Token: {symbol} ({_short(token_address)})",
+        "",
+        f"Events: {summary.total} ({summary.swaps} swaps, {summary.transfers} transfers)",
+    ]
+
+    coverage = (
+        f"Priced: {summary.priced}/{summary.complete_hour_events} complete-hour events "
+        f"({summary.coverage_pct:.0f}%)"
+    )
+    pending_label = (
+        f"current hour {summary.pending_hour.strftime('%Y-%m-%d %H:%MZ')}"
+        if summary.pending_hour is not None
+        else "none"
+    )
+    coverage += f"   Pending: {summary.pending} ({pending_label})"
+    coverage += f"   Unavailable: {summary.unavailable}"
+    if summary.unavailable_hours:
+        hours = ", ".join(h.strftime("%Y-%m-%d %H:%MZ") for h in summary.unavailable_hours)
+        coverage += f" [{hours}]"
+    lines.append(coverage)
+
+    if summary.pending:
+        lines += [
+            "",
+            f"Note: {summary.pending} event(s) fall in {pending_label}, which DefiLlama has "
+            "not published a price for yet.",
+            "      They are pending, not missing — the next prices backfill will price them. "
+            "Coverage above counts complete hours only.",
+        ]
+    if summary.unavailable_hours:
+        lines += [
+            "",
+            f"Warning: {summary.unavailable} event(s) fall in past hours with no price row. "
+            "That is a real gap in the",
+            "         prices backfill, not a lag. Re-run AW_03 to cover the hours listed above.",
+        ]
+
+    lines.append("")
+    if not events:
+        lines.append("(no events)")
+    for event in events:
+        lines.append(format_event_line(event, symbol))
+
+    return "\n".join(lines)
+
+
+# ---------- CLI ----------
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI arg parser. Extracted so tests can call it in isolation."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prove the three Week 1 schemas join: show one wallet's swaps and "
+            "transfers for one token, priced from the hourly grid. Reads the "
+            "local DuckDB cache only."
+        ),
+    )
+    parser.add_argument(
+        "--wallet",
+        default=None,
+        help="Wallet address. Omit to auto-pick the most active wallet in the cache.",
+    )
+    parser.add_argument(
+        "--chain",
+        default="ethereum",
+        choices=["ethereum", "base"],
+        help="Target chain (V1 scope per CLAUDE.md Section 2). Default: ethereum.",
+    )
+    parser.add_argument(
+        "--token",
+        default=UNI_ETHEREUM,
+        help=f"Token contract address. Default: UNI ({UNI_ETHEREUM}).",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="Optional DuckDB path override.",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Log query progress at INFO level.",
+    )
+    return parser
+
+
+def main() -> int:
+    """CLI entry point for the wallet activity proof.
+
+    Returns:
+        0 on success, 1 when the cache holds no activity to prove anything with.
+        A non-zero exit is reserved for "nothing to show" rather than used for an
+        unpriced event: an unavailable price is reported loudly in the output but
+        is a data finding, not a failure of this stage.
+    """
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    with connect(args.db_path) as conn:
+        wallet = args.wallet
+        if wallet is None:
+            wallet = query_most_active_wallet(conn, args.chain, args.token)
+            if wallet is None:
+                print(
+                    f"No activity in the cache for chain={args.chain} "
+                    f"token={args.token}.\n"
+                    "Backfill first: AW_01 for swaps, AW_02 for transfers, AW_03 for prices.",
+                )
+                return 1
+            logger.info("Auto-picked most active wallet: %s", wallet)
+
+        events, summary = build_wallet_timeline(
+            conn,
+            wallet_address=wallet,
+            chain=args.chain,
+            token_address=args.token,
+        )
+
+    if not events:
+        print(
+            f"No events for wallet={wallet} chain={args.chain} token={args.token}.\n"
+            "The wallet has no swaps or transfers of this token in the cache.",
+        )
+        return 1
+
+    print(format_timeline(events, summary, wallet, args.chain, args.token))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
