@@ -36,6 +36,7 @@ import logging
 
 from duckdb import DuckDBPyConnection
 
+from alphawallets.db import assert_table_matches_ddl
 from alphawallets.fetchers.prices.models import TokenPrice
 
 logger = logging.getLogger(__name__)
@@ -62,13 +63,31 @@ CREATE TABLE IF NOT EXISTS token_price (
 """
 
 
+# Expected shape of the table above, for the schema-drift guard in
+# create_tables(). Deliberately hand-written next to the DDL rather than parsed
+# out of it: a reviewer changing one and not the other is the drift this catches,
+# and a parser would happily agree with a typo.
+TOKEN_PRICE_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("token_address", "VARCHAR"),
+    ("ts", "TIMESTAMPTZ"),
+    ("price_usd", "DOUBLE"),
+    ("confidence", "DOUBLE"),
+    ("source", "VARCHAR"),
+    ("fetched_at", "TIMESTAMPTZ"),
+]
+
+
 def create_tables(conn: DuckDBPyConnection) -> None:
     """Create the token_price table if it doesn't exist. Safe to call every run.
 
     No secondary indexes — see the module docstring for why (AW_02's EXPLAIN
     finding). PRIMARY KEY uniqueness is enforced automatically.
+
+    The table is then checked against its DDL — see assert_table_matches_ddl.
     """
     conn.execute(TOKEN_PRICE_DDL)
+    assert_table_matches_ddl(conn, "token_price", TOKEN_PRICE_COLUMNS)
 
 
 # ---------- Writes ----------

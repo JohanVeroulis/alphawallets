@@ -4,9 +4,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from alphawallets.db import connect
+from alphawallets.db import SchemaDriftError, _canonical_type, connect, live_columns
 from alphawallets.fetchers.uniswap_v3.models import RawSwapLog, UniswapV3Swap
 from alphawallets.fetchers.uniswap_v3.writer import (
+    DECODED_TABLE_COLUMNS,
+    RAW_TABLE_COLUMNS,
     create_tables,
     write_decoded_swaps,
     write_raw_logs,
@@ -76,6 +78,39 @@ class TestCreateTables:
         # Second call must not fail
         create_tables(conn)
         create_tables(conn)
+
+    def test_guard_matches_the_tables_this_writer_creates(self, conn):
+        """EXPECTED_COLUMNS must agree with the DDL beside it.
+
+        Both are hand-written, so this is the test that keeps them in step.
+        """
+        assert live_columns(conn, "raw_uniswap_v3_swap") == [
+            (name, _canonical_type(type_name)) for name, type_name in RAW_TABLE_COLUMNS
+        ]
+        assert live_columns(conn, "uniswap_v3_swap") == [
+            (name, _canonical_type(type_name)) for name, type_name in DECODED_TABLE_COLUMNS
+        ]
+
+    def test_pre_tx_from_table_raises_schema_drift(self):
+        """End-to-end: the real pre-PR#15 cache shape, through create_tables().
+
+        Reproduces the failure found while building the wallet activity proof:
+        a cache file created before tx_from existed. Previously this surfaced as
+        'table uniswap_v3_swap has 13 columns but 14 values were supplied' from
+        deep inside write_decoded_swaps.
+        """
+        with connect(":memory:") as c:
+            c.execute(
+                """CREATE TABLE uniswap_v3_swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       tx_hash VARCHAR, log_index INTEGER, pool_address VARCHAR,
+                       sender VARCHAR, recipient VARCHAR, amount0 VARCHAR,
+                       amount1 VARCHAR, sqrt_price_x96 VARCHAR, liquidity VARCHAR,
+                       tick INTEGER
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError, match="tx_from"):
+                create_tables(c)
 
 
 # ---------- Raw log writes ----------

@@ -2,16 +2,33 @@
 
 import time
 from datetime import UTC, datetime
+from typing import ClassVar
 
 import duckdb
 import pytest
 
-from alphawallets.db import SESSION_TIMEZONE, connect
+from alphawallets.db import (
+    SESSION_TIMEZONE,
+    SchemaDriftError,
+    assert_table_matches_ddl,
+    connect,
+    live_columns,
+)
 
 # A deliberately awkward zone: UTC+5:30. A half-hour offset is what turns a
 # locale-dependent date_trunc('hour', ...) from "harmless" into "matches no
 # price row", because the result is no longer on an hour boundary in UTC.
 HALF_HOUR_OFFSET_TZ = "Asia/Kolkata"
+
+# The post-PR#15 uniswap_v3_swap shape, trimmed to the columns the guard tests
+# need. Real drift case: this table gained tx_from while cache files did not.
+SWAP_EXPECTED_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("block_number", "BIGINT"),
+    ("block_timestamp", "TIMESTAMPTZ"),
+    ("log_index", "INTEGER"),
+    ("tx_from", "VARCHAR"),
+]
 
 
 @pytest.fixture
@@ -144,3 +161,127 @@ class TestSessionTimezone:
     def test_session_timezone_constant_is_utc(self):
         """The constant is the documented contract, not an incidental default."""
         assert SESSION_TIMEZONE == "UTC"
+
+
+class TestLiveColumns:
+    def test_reports_names_and_canonical_types_in_order(self):
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE t (a VARCHAR, b BIGINT, c TIMESTAMPTZ)")
+            assert live_columns(conn, "t") == [
+                ("a", "VARCHAR"),
+                ("b", "BIGINT"),
+                ("c", "TIMESTAMP WITH TIME ZONE"),
+            ]
+
+    def test_ddl_and_pragma_timestamptz_spellings_are_equal(self):
+        """TIMESTAMPTZ in a DDL comes back as TIMESTAMP WITH TIME ZONE.
+
+        Without the alias table every writer's guard would fire on every run.
+        """
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE t (ts TIMESTAMPTZ)")
+            assert live_columns(conn, "t") == [("ts", "TIMESTAMP WITH TIME ZONE")]
+
+
+class TestAssertTableMatchesDdl:
+    """The guard for migration-less schemas.
+
+    CREATE TABLE IF NOT EXISTS silently accepts an out-of-date table, so adding a
+    column to a DDL leaves older cache files on the old shape until a write dies
+    with a column-count error that names nothing. Modelled on the real case:
+    uniswap_v3_swap gained tx_from in PR #15 and the local cache never caught up.
+    """
+
+    EXPECTED: ClassVar[list[tuple[str, str]]] = SWAP_EXPECTED_COLUMNS
+
+    def test_fresh_table_passes(self):
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index INTEGER, tx_from VARCHAR
+                   )"""
+            )
+            assert_table_matches_ddl(conn, "swap", self.EXPECTED)  # does not raise
+
+    def test_missing_column_is_named(self):
+        """The real pre-PR#15 case: tx_from absent from the live table."""
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index INTEGER
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "tx_from" in message
+        assert "missing columns" in message
+        assert "swap" in message
+
+    def test_extra_column_is_named(self):
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index INTEGER, tx_from VARCHAR, leftover_experiment VARCHAR
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "leftover_experiment" in message
+        assert "extra columns" in message
+
+    def test_type_mismatch_names_both_types(self):
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index BIGINT, tx_from VARCHAR
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "type mismatches" in message
+        assert "log_index" in message
+        assert "INTEGER" in message  # what the DDL wants
+        assert "BIGINT" in message  # what the table has
+
+    def test_all_three_drift_kinds_reported_together(self):
+        """One run should name every problem, not just the first one found."""
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index BIGINT, leftover_experiment VARCHAR
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "tx_from" in message  # missing
+        assert "leftover_experiment" in message  # extra
+        assert "log_index" in message  # mismatched
+
+    def test_message_says_it_does_not_migrate(self):
+        """The guard surfaces drift; migration is the operator's decision."""
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE swap (chain VARCHAR)")
+            with pytest.raises(SchemaDriftError, match="does not migrate"):
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+    def test_does_not_alter_the_table(self):
+        """A guard that quietly patched the schema would defeat its own purpose."""
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE swap (chain VARCHAR)")
+            before = live_columns(conn, "swap")
+            with pytest.raises(SchemaDriftError):
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+            assert live_columns(conn, "swap") == before
