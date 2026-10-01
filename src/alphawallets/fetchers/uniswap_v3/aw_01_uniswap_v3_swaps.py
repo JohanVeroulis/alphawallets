@@ -64,6 +64,11 @@ ABI_PATH = Path(__file__).parent / "abis" / "uniswap_v3_pool.json"
 # See CLAUDE.md Section 2 for the tracked-pairs list.
 DEFAULT_ETHEREUM_POOLS: dict[str, str] = {
     "USDC/WETH 0.05%": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+    # Verified live on 2026-10-01 via the V3 factory:
+    # getPool(UNI, WETH, 3000) -> this address, token0=UNI, token1=WETH, fee=3000.
+    # UNI is both a tracked DeFi token and a tracked airdrop (CLAUDE.md Section 2),
+    # so this pool is where swap, transfer and price data overlap for one asset.
+    "UNI/WETH 0.3%": "0x1d42064Fc4Beb5F8aAF85F4617AE8b3b5B8Bd801",
 }
 
 

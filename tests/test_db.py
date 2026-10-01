@@ -1,8 +1,44 @@
 """Tests for the DuckDB connection helper."""
 
+import time
+from datetime import UTC, datetime
+from typing import ClassVar
+
+import duckdb
 import pytest
 
-from alphawallets.db import connect
+from alphawallets.db import (
+    SESSION_TIMEZONE,
+    SchemaDriftError,
+    assert_table_matches_ddl,
+    connect,
+    live_columns,
+)
+
+# A deliberately awkward zone: UTC+5:30. A half-hour offset is what turns a
+# locale-dependent date_trunc('hour', ...) from "harmless" into "matches no
+# price row", because the result is no longer on an hour boundary in UTC.
+HALF_HOUR_OFFSET_TZ = "Asia/Kolkata"
+
+# The post-PR#15 uniswap_v3_swap shape, trimmed to the columns the guard tests
+# need. Real drift case: this table gained tx_from while cache files did not.
+SWAP_EXPECTED_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("block_number", "BIGINT"),
+    ("block_timestamp", "TIMESTAMPTZ"),
+    ("log_index", "INTEGER"),
+    ("tx_from", "VARCHAR"),
+]
+
+
+@pytest.fixture
+def host_tz_kolkata(monkeypatch):
+    """Run the test as if the host machine were in Asia/Kolkata."""
+    monkeypatch.setenv("TZ", HALF_HOUR_OFFSET_TZ)
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
 
 
 class TestConnect:
@@ -54,3 +90,198 @@ class TestConnect:
         # After exit, calling anything on the closed connection should raise
         with pytest.raises(Exception):  # noqa: B017 — duckdb raises ConnectionException
             conn.execute("SELECT 1")
+
+
+class TestSessionTimezone:
+    """The session timezone must be UTC regardless of the host locale.
+
+    Regression tests for a silent integration failure found while building the
+    wallet activity proof: the PnL join is
+    date_trunc('hour', block_timestamp) = token_price.ts, token_price.ts is
+    always hour-aligned UTC, and date_trunc on a TIMESTAMPTZ truncates in the
+    session timezone. On a half-hour-offset host the truncated value is not on a
+    UTC hour boundary, so the join matches nothing and reports zero rows rather
+    than an error.
+    """
+
+    def test_session_timezone_is_utc(self):
+        with connect(":memory:") as conn:
+            assert conn.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
+
+    def test_session_timezone_is_utc_on_half_hour_offset_host(self, host_tz_kolkata):
+        with connect(":memory:") as conn:
+            assert conn.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
+
+    def test_unpinned_connection_would_not_be_utc(self, host_tz_kolkata):
+        """Control: prove the fixture actually changes what DuckDB would do.
+
+        Without this, the test above could pass simply because the host is
+        already UTC, and the pin would be untested.
+        """
+        conn = duckdb.connect(":memory:")
+        try:
+            assert conn.execute("SELECT current_setting('TimeZone')").fetchone()[0] != "UTC"
+        finally:
+            conn.close()
+
+    def test_hour_truncation_lands_on_utc_hour_boundary(self, host_tz_kolkata):
+        """The join key itself, on the host that would break it."""
+        # 14:53:11Z — mid-hour, so truncation has somewhere wrong to land.
+        instant = datetime(2026, 9, 27, 14, 53, 11, tzinfo=UTC)
+
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE e (ts TIMESTAMPTZ)")
+            conn.execute("INSERT INTO e VALUES (?)", [instant])
+            truncated = conn.execute("SELECT date_trunc('hour', ts) FROM e").fetchone()[0]
+
+        assert truncated.astimezone(UTC) == datetime(2026, 9, 27, 14, 0, 0, tzinfo=UTC)
+        assert (truncated.minute, truncated.second) == (0, 0)
+
+    def test_hour_truncation_join_matches_a_price_row(self, host_tz_kolkata):
+        """End-to-end shape of the real join, including the half-hour trap.
+
+        Asia/Kolkata truncation would produce 14:30Z, so a match here means the
+        pin is doing its job; a zero-row result is the silent failure mode.
+        """
+        event_ts = datetime(2026, 9, 27, 14, 53, 11, tzinfo=UTC)
+        price_ts = datetime(2026, 9, 27, 14, 0, 0, tzinfo=UTC)
+
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE e (ts TIMESTAMPTZ)")
+            conn.execute("CREATE TABLE p (ts TIMESTAMPTZ, price DOUBLE)")
+            conn.execute("INSERT INTO e VALUES (?)", [event_ts])
+            conn.execute("INSERT INTO p VALUES (?, ?)", [price_ts, 8.94])
+
+            matched = conn.execute(
+                "SELECT p.price FROM e LEFT JOIN p ON date_trunc('hour', e.ts) = p.ts"
+            ).fetchall()
+
+        assert matched == [(8.94,)]
+
+    def test_session_timezone_constant_is_utc(self):
+        """The constant is the documented contract, not an incidental default."""
+        assert SESSION_TIMEZONE == "UTC"
+
+
+class TestLiveColumns:
+    def test_reports_names_and_canonical_types_in_order(self):
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE t (a VARCHAR, b BIGINT, c TIMESTAMPTZ)")
+            assert live_columns(conn, "t") == [
+                ("a", "VARCHAR"),
+                ("b", "BIGINT"),
+                ("c", "TIMESTAMP WITH TIME ZONE"),
+            ]
+
+    def test_ddl_and_pragma_timestamptz_spellings_are_equal(self):
+        """TIMESTAMPTZ in a DDL comes back as TIMESTAMP WITH TIME ZONE.
+
+        Without the alias table every writer's guard would fire on every run.
+        """
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE t (ts TIMESTAMPTZ)")
+            assert live_columns(conn, "t") == [("ts", "TIMESTAMP WITH TIME ZONE")]
+
+
+class TestAssertTableMatchesDdl:
+    """The guard for migration-less schemas.
+
+    CREATE TABLE IF NOT EXISTS silently accepts an out-of-date table, so adding a
+    column to a DDL leaves older cache files on the old shape until a write dies
+    with a column-count error that names nothing. Modelled on the real case:
+    uniswap_v3_swap gained tx_from in PR #15 and the local cache never caught up.
+    """
+
+    EXPECTED: ClassVar[list[tuple[str, str]]] = SWAP_EXPECTED_COLUMNS
+
+    def test_fresh_table_passes(self):
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index INTEGER, tx_from VARCHAR
+                   )"""
+            )
+            assert_table_matches_ddl(conn, "swap", self.EXPECTED)  # does not raise
+
+    def test_missing_column_is_named(self):
+        """The real pre-PR#15 case: tx_from absent from the live table."""
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index INTEGER
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "tx_from" in message
+        assert "missing columns" in message
+        assert "swap" in message
+
+    def test_extra_column_is_named(self):
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index INTEGER, tx_from VARCHAR, leftover_experiment VARCHAR
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "leftover_experiment" in message
+        assert "extra columns" in message
+
+    def test_type_mismatch_names_both_types(self):
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index BIGINT, tx_from VARCHAR
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "type mismatches" in message
+        assert "log_index" in message
+        assert "INTEGER" in message  # what the DDL wants
+        assert "BIGINT" in message  # what the table has
+
+    def test_all_three_drift_kinds_reported_together(self):
+        """One run should name every problem, not just the first one found."""
+        with connect(":memory:") as conn:
+            conn.execute(
+                """CREATE TABLE swap (
+                       chain VARCHAR, block_number BIGINT, block_timestamp TIMESTAMPTZ,
+                       log_index BIGINT, leftover_experiment VARCHAR
+                   )"""
+            )
+            with pytest.raises(SchemaDriftError) as excinfo:
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+        message = str(excinfo.value)
+        assert "tx_from" in message  # missing
+        assert "leftover_experiment" in message  # extra
+        assert "log_index" in message  # mismatched
+
+    def test_message_says_it_does_not_migrate(self):
+        """The guard surfaces drift; migration is the operator's decision."""
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE swap (chain VARCHAR)")
+            with pytest.raises(SchemaDriftError, match="does not migrate"):
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+
+    def test_does_not_alter_the_table(self):
+        """A guard that quietly patched the schema would defeat its own purpose."""
+        with connect(":memory:") as conn:
+            conn.execute("CREATE TABLE swap (chain VARCHAR)")
+            before = live_columns(conn, "swap")
+            with pytest.raises(SchemaDriftError):
+                assert_table_matches_ddl(conn, "swap", self.EXPECTED)
+            assert live_columns(conn, "swap") == before

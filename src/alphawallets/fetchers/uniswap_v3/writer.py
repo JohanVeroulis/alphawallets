@@ -22,6 +22,7 @@ import logging
 
 from duckdb import DuckDBPyConnection
 
+from alphawallets.db import assert_table_matches_ddl
 from alphawallets.fetchers.uniswap_v3.models import RawSwapLog, UniswapV3Swap
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,24 @@ CREATE TABLE IF NOT EXISTS raw_uniswap_v3_swap (
 );
 """
 
+
+# Expected shape of the table above, for the schema-drift guard in
+# create_tables(). Deliberately hand-written next to the DDL rather than parsed
+# out of it: a reviewer changing one and not the other is the drift this catches,
+# and a parser would happily agree with a typo.
+RAW_TABLE_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("block_number", "BIGINT"),
+    ("block_hash", "VARCHAR"),
+    ("tx_hash", "VARCHAR"),
+    ("log_index", "INTEGER"),
+    ("transaction_index", "INTEGER"),
+    ("address", "VARCHAR"),
+    ("topics", "VARCHAR[]"),
+    ("data", "VARCHAR"),
+    ("removed", "BOOLEAN"),
+]
+
 DECODED_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS uniswap_v3_swap (
     chain            VARCHAR     NOT NULL,
@@ -67,10 +86,36 @@ CREATE TABLE IF NOT EXISTS uniswap_v3_swap (
 """
 
 
+DECODED_TABLE_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("block_number", "BIGINT"),
+    ("block_timestamp", "TIMESTAMPTZ"),
+    ("tx_hash", "VARCHAR"),
+    ("log_index", "INTEGER"),
+    ("pool_address", "VARCHAR"),
+    ("tx_from", "VARCHAR"),
+    ("sender", "VARCHAR"),
+    ("recipient", "VARCHAR"),
+    ("amount0", "VARCHAR"),
+    ("amount1", "VARCHAR"),
+    ("sqrt_price_x96", "VARCHAR"),
+    ("liquidity", "VARCHAR"),
+    ("tick", "INTEGER"),
+]
+
+
 def create_tables(conn: DuckDBPyConnection) -> None:
-    """Create both tables if they don't already exist. Safe to call every run."""
+    """Create both tables if they don't already exist. Safe to call every run.
+
+    Then check both against their DDLs. A cache file written before tx_from was
+    added (PR #15) keeps the old 13-column shape, because CREATE TABLE IF NOT
+    EXISTS does nothing to an existing table — the guard names that drift instead
+    of letting the first write fail on a column count.
+    """
     conn.execute(RAW_TABLE_DDL)
     conn.execute(DECODED_TABLE_DDL)
+    assert_table_matches_ddl(conn, "raw_uniswap_v3_swap", RAW_TABLE_COLUMNS)
+    assert_table_matches_ddl(conn, "uniswap_v3_swap", DECODED_TABLE_COLUMNS)
 
 
 # ---------- Writes ----------

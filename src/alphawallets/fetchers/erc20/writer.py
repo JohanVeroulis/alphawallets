@@ -34,6 +34,7 @@ import logging
 
 from duckdb import DuckDBPyConnection
 
+from alphawallets.db import assert_table_matches_ddl
 from alphawallets.fetchers.erc20.models import ERC20Transfer, RawAssetTransfer
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,28 @@ CREATE TABLE IF NOT EXISTS raw_erc20_transfer (
 );
 """
 
+
+# Expected shape of the table above, for the schema-drift guard in
+# create_tables(). Deliberately hand-written next to the DDL rather than parsed
+# out of it: a reviewer changing one and not the other is the drift this catches,
+# and a parser would happily agree with a typo.
+RAW_TABLE_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("unique_id", "VARCHAR"),
+    ("block_num", "BIGINT"),
+    ("tx_hash", "VARCHAR"),
+    ("from_addr", "VARCHAR"),
+    ("to_addr", "VARCHAR"),
+    ("value_raw", "VARCHAR"),
+    ("value_decimal", "DOUBLE"),
+    ("asset", "VARCHAR"),
+    ("category", "VARCHAR"),
+    ("contract_address", "VARCHAR"),
+    ("contract_decimal", "INTEGER"),
+    ("log_index", "INTEGER"),
+    ("block_timestamp", "TIMESTAMPTZ"),
+]
+
 DECODED_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS erc20_transfer (
     chain            VARCHAR     NOT NULL,
@@ -80,6 +103,21 @@ CREATE TABLE IF NOT EXISTS erc20_transfer (
 """
 
 
+DECODED_TABLE_COLUMNS: list[tuple[str, str]] = [
+    ("chain", "VARCHAR"),
+    ("block_number", "BIGINT"),
+    ("block_timestamp", "TIMESTAMPTZ"),
+    ("tx_hash", "VARCHAR"),
+    ("log_index", "INTEGER"),
+    ("unique_id", "VARCHAR"),
+    ("token_address", "VARCHAR"),
+    ("from_addr", "VARCHAR"),
+    ("to_addr", "VARCHAR"),
+    ("value_raw", "VARCHAR"),
+    ("token_decimals", "INTEGER"),
+]
+
+
 def create_tables(conn: DuckDBPyConnection) -> None:
     """Create both tables if they don't already exist. Safe to call every run.
 
@@ -87,9 +125,13 @@ def create_tables(conn: DuckDBPyConnection) -> None:
     tried at V1 row counts (measured on 50k rows, including the composite
     (chain, tx_hash, log_index) candidate). PRIMARY KEY uniqueness is enforced
     automatically and is unaffected.
+
+    Both tables are then checked against their DDLs — see assert_table_matches_ddl.
     """
     conn.execute(RAW_TABLE_DDL)
     conn.execute(DECODED_TABLE_DDL)
+    assert_table_matches_ddl(conn, "raw_erc20_transfer", RAW_TABLE_COLUMNS)
+    assert_table_matches_ddl(conn, "erc20_transfer", DECODED_TABLE_COLUMNS)
 
 
 # ---------- Writes ----------
