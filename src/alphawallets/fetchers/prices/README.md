@@ -64,3 +64,20 @@ uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices 
     --token 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
     --span-days 30
 ```
+
+## Resume mode
+
+```bash
+uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices \
+    --chain ethereum \
+    --token 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
+    --resume
+```
+
+Continues from `MAX(ts)` in `token_price` for that `(chain, token_address)` **and `source='defillama'`**, converting the gap into a span in whole days.
+
+The source filter is load-bearing. `source` is in the primary key precisely so a CoinGecko backfill can sit beside the DefiLlama rows (see Storage semantics above), which means an unfiltered `MAX(ts)` would let another provider's coverage convince this fetcher it had already fetched a span it never requested.
+
+The span is rounded **up** and never below 1, so a partial day is covered rather than left as a hole. Erring long costs a few redundant points because the writer's `INSERT OR IGNORE` drops hours already stored; erring short would leave a gap. When nothing is stored, it logs at INFO and falls back to the default 30-day span. Mutually exclusive with `--span-days`.
+
+Note the price grid trails the chain head by roughly two hours, so a resume run will not reach the current hour — see [ADR 0009](../../../../docs/decisions/0009-duckdb-connection-and-schema-conventions.md) for how pipeline stages distinguish that lag from a real gap.

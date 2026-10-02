@@ -33,3 +33,16 @@ Airdrop-sourced balances must be traceable back to the original distribution tra
 - `erc20_transfer` — normalized pipeline input, PK `(chain, unique_id)`
 
 Entries that map but lack `metadata.blockTimestamp` are written to the raw table only; the decoded table requires a timestamp because every downstream consumer keys on time. `FetchResult.decoded_skipped_missing_timestamp` reports the count.
+
+## Resume mode
+
+```bash
+uv run python -m alphawallets.fetchers.erc20.aw_02_erc20_transfers \
+    --chain ethereum \
+    --contract 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
+    --resume
+```
+
+Continues from `MAX(block_number)` in `erc20_transfer` for that `(chain, token_address)`, up to the current head. Reads the **decoded** table, not the raw one — raw rows can include transfers the mapper dropped, so decoded is the pipeline's source of truth (CLAUDE.md §6).
+
+Scoped per token, so one token's backfill does not make another look current. When nothing is stored it logs at INFO and falls back to the default 1000-block window. Mutually exclusive with `--blocks` and `--from-block`/`--to-block`.
