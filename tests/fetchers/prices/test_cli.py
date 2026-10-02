@@ -20,7 +20,10 @@ class TestArgParser:
         args = _build_arg_parser().parse_args(["--chain", "ethereum"])
         assert args.chain == "ethereum"
         assert args.token == UNI
-        assert args.span_days == DEFAULT_SPAN_DAYS
+        # No argparse default: main() applies DEFAULT_SPAN_DAYS, so the mutex with
+        # --resume can distinguish "not passed" from "passed the default value".
+        assert args.span_days is None
+        assert args.resume is False
         assert args.period == DEFAULT_PERIOD
 
     def test_token_override(self):
