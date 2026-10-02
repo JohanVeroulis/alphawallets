@@ -187,6 +187,8 @@ Output tables: raw_uniswap_v3_swap, uniswap_v3_swap
 
 Items marked *provisional* are working assumptions, to be validated in Weeks 1–3 with real data. Record any change as an ADR.
 
+**DuckDB operational conventions** discovered through PR #22 — the UTC session pin, the schema-drift guard, and grid-head-relative price classification — are recorded in [ADR 0009](docs/decisions/0009-duckdb-connection-and-schema-conventions.md). They were never tracked as open questions here; the ADR is their record, and it is the place to look before changing how a connection is opened, a table is created, or an unpriced event is classified.
+
 ### Decided
 - [x] **Data source:** Alchemy free tier — see [ADR 0003](docs/decisions/0003-alchemy-over-dune.md)
 - [x] **Local cache:** DuckDB — see [ADR 0004](docs/decisions/0004-duckdb-cache.md)
