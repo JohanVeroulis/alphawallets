@@ -28,3 +28,4 @@ This folder records significant decisions: what we chose, why, and what we gave 
 | [0006](0006-alchemy-eth-getlogs-block-window.md) | Alchemy free-tier eth_getLogs is capped at 10 blocks per request | Accepted |
 | [0007](0007-alchemy-cups-constraint.md) | Alchemy free-tier CUPS constrains request concentration, not total volume | Accepted |
 | [0008](0008-defillama-historical-prices.md) | DefiLlama as V1 historical price source | Accepted |
+| [0009](0009-duckdb-connection-and-schema-conventions.md) | DuckDB connection and schema conventions | Accepted |
