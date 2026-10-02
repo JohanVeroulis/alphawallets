@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from duckdb import DuckDBPyConnection
 from pydantic import BaseModel, ConfigDict, Field
 from web3 import Web3
 from web3.types import FilterParams, LogReceipt
@@ -372,6 +373,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "Cannot be combined with --blocks.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue from the highest block already stored for this chain and "
+            "pool, up to the current head. Falls back to the default "
+            "window when nothing is stored yet. Cannot be combined with "
+            "--blocks / --from-block / --to-block."
+        ),
+    )
+    parser.add_argument(
         "--db-path",
         type=Path,
         default=None,
@@ -386,6 +397,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def get_resume_point(conn: DuckDBPyConnection, chain: str, pool_address: str) -> int | None:
+    """Return the highest block already stored for this (chain, pool), or None.
+
+    Reads the decoded table, not the raw one: raw rows can include logs the
+    pipeline later excluded as reorged, so the decoded table is the pipeline's
+    source of truth (CLAUDE.md Section 6).
+
+    Args:
+        conn: Open DuckDB connection.
+        chain: Chain name.
+        pool_address: Uniswap V3 pool contract, any case.
+
+    Returns:
+        The highest stored block number, or None when nothing is stored for this
+        (chain, pool_address) — including when the table does not exist yet.
+    """
+    row = conn.execute(
+        "SELECT MAX(block_number) FROM uniswap_v3_swap WHERE chain = ? AND lower(pool_address) = ?",
+        [chain, pool_address.lower()],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
 def _validate_range_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Validate range args and return the effective block count for head-relative mode.
 
@@ -396,6 +432,10 @@ def _validate_range_args(args: argparse.Namespace, parser: argparse.ArgumentPars
         parser.error("--from-block and --to-block must be provided together")
     if args.blocks is not None and args.from_block is not None:
         parser.error("--blocks cannot be combined with --from-block / --to-block")
+    if args.resume and args.blocks is not None:
+        parser.error("--resume cannot be combined with --blocks")
+    if args.resume and args.from_block is not None:
+        parser.error("--resume cannot be combined with --from-block / --to-block")
     if args.from_block is not None:
         return 0
     return args.blocks if args.blocks is not None else 1000
@@ -412,19 +452,51 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    mode = f"head-relative ({blocks_default:,} blocks)"
     if args.from_block is not None:
+        mode = "explicit range"
         from_block = args.from_block
         to_block = args.to_block
     else:
         w3 = make_web3(args.chain)
         current = w3.eth.block_number
-        from_block = current - blocks_default + 1
-        to_block = current
+
+        resume_from: int | None = None
+        if args.resume:
+            with connect(args.db_path) as conn:
+                create_tables(conn)
+                resume_from = get_resume_point(conn, args.chain, args.pool)
+            if resume_from is None:
+                logger.info(
+                    "Resume: nothing stored for chain=%s pool=%s; defaulting to %d blocks",
+                    args.chain,
+                    args.pool,
+                    blocks_default,
+                )
+                mode = f"resume — no previous data, defaulting to {blocks_default:,} blocks"
+            else:
+                logger.info(
+                    "Resume: highest stored block %d; fetching from %d",
+                    resume_from,
+                    resume_from + 1,
+                )
+                mode = f"resume from stored block {resume_from:,}"
+
+        if resume_from is not None:
+            # +1 so the stored block is not re-fetched. An off-by-one here wastes
+            # at most one block of work: INSERT OR IGNORE makes overlap harmless,
+            # so this arithmetic is not a correctness concern.
+            from_block = resume_from + 1
+            to_block = current
+        else:
+            from_block = current - blocks_default + 1
+            to_block = current
 
     print(
         f"AlphaWallets — Uniswap V3 Swap Fetcher\n"
         f"  Chain:      {args.chain}\n"
         f"  Pool:       {args.pool}\n"
+        f"  Mode:       {mode}\n"
         f"  From block: {from_block:,}\n"
         f"  To block:   {to_block:,}\n"
         f"  Windows:    {(to_block - from_block) // BLOCK_WINDOW_SIZE + 1}\n"

@@ -85,17 +85,35 @@ uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
     --chain ethereum \
     --pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640
 
+# ...or continue from the highest block already stored for that pool
+uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
+    --chain ethereum \
+    --pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640 \
+    --resume
+
 # Run the ERC-20 transfers fetcher (last 1000 blocks of UNI on Ethereum)
 uv run python -m alphawallets.fetchers.erc20.aw_02_erc20_transfers \
     --chain ethereum \
     --contract 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
     --blocks 1000
 
+# ...or continue from the highest block already stored for that token
+uv run python -m alphawallets.fetchers.erc20.aw_02_erc20_transfers \
+    --chain ethereum \
+    --contract 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
+    --resume
+
 # Run the DefiLlama historical prices fetcher (30 days hourly UNI on Ethereum)
 uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices \
     --chain ethereum \
     --token 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
     --span-days 30
+
+# ...or continue from the newest hour already stored for that token
+uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices \
+    --chain ethereum \
+    --token 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
+    --resume
 
 # Prove the three schemas join: one wallet's priced UNI timeline (auto-picks a wallet)
 uv run python -m alphawallets.pipeline.exploration.wallet_activity_proof

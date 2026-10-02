@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+from duckdb import DuckDBPyConnection
 from pydantic import BaseModel, ConfigDict, Field
 
 from alphawallets.config import Chain
@@ -177,6 +179,57 @@ def fetch_and_persist_prices(
 # ---------- CLI ----------
 
 
+def get_resume_point(
+    conn: DuckDBPyConnection,
+    chain: str,
+    token_address: str,
+) -> datetime | None:
+    """Return the newest priced hour already stored for this (chain, token), or None.
+
+    Scoped to source='defillama' so a future CoinGecko backfill cannot make this
+    fetcher believe it has already covered a span. The four-column primary key
+    keeps both sources' rows side by side, which is exactly why the filter is
+    needed here.
+
+    Args:
+        conn: Open DuckDB connection.
+        chain: Chain name.
+        token_address: Token contract, any case.
+
+    Returns:
+        The newest stored hour as a UTC datetime, or None when this fetcher has
+        stored nothing for this (chain, token).
+    """
+    row = conn.execute(
+        "SELECT MAX(ts) FROM token_price "
+        "WHERE chain = ? AND lower(token_address) = ? AND source = 'defillama'",
+        [chain, token_address.lower()],
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return row[0].astimezone(UTC)
+
+
+def span_days_since(resume_point: datetime, now_utc: datetime | None = None) -> int:
+    """Days of history needed to reach back to a resume point, rounded up.
+
+    Rounded up, and never below 1, so a partial day is covered rather than left
+    as a hole. Overlap is free: the writer's INSERT OR IGNORE drops hours already
+    stored, so erring long costs a few redundant points and erring short would
+    leave a gap.
+
+    Args:
+        resume_point: Newest stored hour, from get_resume_point.
+        now_utc: Current time, injectable for deterministic tests.
+
+    Returns:
+        A span in whole days, at least 1.
+    """
+    reference = now_utc if now_utc is not None else datetime.now(tz=UTC)
+    elapsed = reference.astimezone(UTC) - resume_point.astimezone(UTC)
+    return max(1, math.ceil(elapsed.total_seconds() / 86400))
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     """Build the CLI arg parser. Extracted so tests can call it in isolation."""
     parser = argparse.ArgumentParser(
@@ -196,13 +249,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--span-days",
         type=int,
-        default=DEFAULT_SPAN_DAYS,
-        help=f"Days of history to fetch. Default: {DEFAULT_SPAN_DAYS}.",
+        # No argparse default: main() applies DEFAULT_SPAN_DAYS itself, so the
+        # mutex with --resume can tell "not passed" from "passed the default".
+        default=None,
+        help=f"Days of history to fetch. Default: {DEFAULT_SPAN_DAYS}. "
+        "Cannot be combined with --resume.",
     )
     parser.add_argument(
         "--period",
         default=DEFAULT_PERIOD,
         help=f"Sampling interval. Default: {DEFAULT_PERIOD}.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue from the newest hour already stored for this chain and token. "
+            "Falls back to the default span when nothing is stored yet. Cannot be "
+            "combined with --span-days."
+        ),
     )
     parser.add_argument(
         "--db-path",
@@ -220,21 +285,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _validate_range_args(
-    args: argparse.Namespace, parser: argparse.ArgumentParser
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    span_days: int | None = None,
 ) -> tuple[int, int, int]:
     """Validate the span/period arguments and return the resulting chunk plan.
 
     Named to mirror AW_01's and AW_02's validators, though this fetcher's range
     is a span in days rather than a block range.
 
+    Args:
+        args: Parsed CLI arguments.
+        parser: The parser, used to exit with a usage message.
+        span_days: Effective span, when main() has already resolved one from a
+            resume point. Falls back to --span-days, then to DEFAULT_SPAN_DAYS.
+
     Returns:
         (total_points, n_chunks, chunk_span) — the same plan fetch_chart will
         follow, so the CLI summary can state it before any request is made.
     """
-    if args.span_days <= 0:
-        parser.error(f"--span-days must be positive, got {args.span_days}")
+    if args.resume and args.span_days is not None:
+        parser.error("--resume cannot be combined with --span-days")
+
+    effective = span_days if span_days is not None else args.span_days
+    if effective is None:
+        effective = DEFAULT_SPAN_DAYS
+    if effective <= 0:
+        parser.error(f"--span-days must be positive, got {effective}")
     try:
-        return chunk_plan(args.span_days, args.period)
+        return chunk_plan(effective, args.period)
     except ValueError as e:
         parser.error(str(e))
         raise  # unreachable: parser.error exits, but keeps the type checker happy
@@ -244,26 +323,61 @@ def main() -> None:
     """CLI entry point for the DefiLlama historical prices fetcher."""
     parser = _build_arg_parser()
     args = parser.parse_args()
-    total_points, n_chunks, _chunk_span = _validate_range_args(args, parser)
 
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # Validate before any DB or network access, so --resume --span-days fails
+    # immediately rather than after opening the cache.
+    _validate_range_args(args, parser)
+
+    span_days = args.span_days if args.span_days is not None else DEFAULT_SPAN_DAYS
+    mode = (
+        f"explicit span ({span_days} days)"
+        if args.span_days is not None
+        else (f"default span ({span_days} days)")
+    )
+
+    if args.resume:
+        with connect(args.db_path) as conn:
+            create_tables(conn)
+            resume_point = get_resume_point(conn, args.chain, args.token)
+        if resume_point is None:
+            logger.info(
+                "Resume: nothing stored for chain=%s token=%s; defaulting to %d days",
+                args.chain,
+                args.token,
+                DEFAULT_SPAN_DAYS,
+            )
+            span_days = DEFAULT_SPAN_DAYS
+            mode = f"resume — no previous data, defaulting to {DEFAULT_SPAN_DAYS} days"
+        else:
+            span_days = span_days_since(resume_point)
+            logger.info(
+                "Resume: newest stored hour %s; fetching %d day(s)",
+                resume_point.isoformat(),
+                span_days,
+            )
+            mode = f"resume from {resume_point.strftime('%Y-%m-%d %H:%MZ')}"
+
+    total_points, n_chunks, _chunk_span = _validate_range_args(args, parser, span_days)
+
     print(
         f"AlphaWallets — DefiLlama Historical Prices\n"
         f"  Chain:  {args.chain}\n"
         f"  Token:  {args.token}\n"
+        f"  Mode:   {mode}\n"
         # RUF001: the multiplication sign is intentional in user-facing output
-        f"  Span:   {args.span_days} days × {args.period} = {total_points} points "  # noqa: RUF001
+        f"  Span:   {span_days} days × {args.period} = {total_points} points "  # noqa: RUF001
         f"→ {n_chunks} chunk{'s' if n_chunks != 1 else ''} (500-cap per request)\n"
     )
 
     result = fetch_and_persist_prices(
         chain=args.chain,
         token_address=args.token,
-        span_days=args.span_days,
+        span_days=span_days,
         period=args.period,
         db_path=args.db_path,
     )
