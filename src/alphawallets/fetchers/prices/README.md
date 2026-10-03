@@ -81,3 +81,34 @@ The source filter is load-bearing. `source` is in the primary key precisely so a
 The span is rounded **up** and never below 1, so a partial day is covered rather than left as a hole. Erring long costs a few redundant points because the writer's `INSERT OR IGNORE` drops hours already stored; erring short would leave a gap. When nothing is stored, it logs at INFO and falls back to the default 30-day span. Mutually exclusive with `--span-days`.
 
 Note the price grid trails the chain head by roughly two hours, so a resume run will not reach the current hour — see [ADR 0009](../../../../docs/decisions/0009-duckdb-connection-and-schema-conventions.md) for how pipeline stages distinguish that lag from a real gap.
+
+## Multi-token
+
+Same `--token-symbol` flag as AW_02, resolved against `--chain` through the V1 registry:
+
+```bash
+uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices \
+    --chain ethereum \
+    --token-symbol AAVE \
+    --span-days 7
+```
+
+`--token 0x...` still works and is mutually exclusive with `--token-symbol`; passing neither keeps the UNI default. The flag is named `--token-symbol` rather than `--token` because `--token` already means the contract address here.
+
+**Known coverage gap: MKR has no `/chart` timeseries.** DefiLlama serves it from `/prices/current` and `/prices/historical` but returns no coin at all on `/chart`, at any span, so this fetcher fails on it:
+
+```
+DefiLlama returned no data for ethereum:0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2
+```
+
+The address is correct and the token is priced — the bulk endpoint simply does not carry it. Measured across all 18 verified `(token, chain)` pairs on 2026-10-03: **17/18 OK, 2,732 rows written in 7s**, MKR the only failure. This is why [ADR 0008](../../../../docs/decisions/0008-defillama-historical-prices.md)'s "100% coverage" result is scoped to `/prices/historical`: coverage is endpoint-specific, and the route this fetcher uses was never what that measurement tested. A `/prices/historical` fallback is proposed as ADR 0010 with MKR as the first case.
+
+### Verifying coverage
+
+Coverage is a query against the registry, not a judgement call:
+
+```sql
+SELECT COUNT(DISTINCT (chain, token_address)) FROM token_price;
+```
+
+Comparing that set against `tokens.all_token_chain_pairs()` returned exactly one missing pair on 2026-10-03 — `('0x9f8f72aa…', 'ethereum')`, MKR — and zero missing from `erc20_transfer`. Any future gap surfaces the same way.

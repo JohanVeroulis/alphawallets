@@ -103,6 +103,13 @@ uv run python -m alphawallets.fetchers.erc20.aw_02_erc20_transfers \
     --contract 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
     --resume
 
+# ...or name the token by symbol, resolved per chain from the V1 registry
+# (src/alphawallets/tokens.py — 12 tokens, 18 verified (token, chain) pairs)
+uv run python -m alphawallets.fetchers.erc20.aw_02_erc20_transfers \
+    --chain base \
+    --token-symbol LINK \
+    --blocks 1000
+
 # Run the DefiLlama historical prices fetcher (30 days hourly UNI on Ethereum)
 uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices \
     --chain ethereum \
@@ -114,6 +121,13 @@ uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices 
     --chain ethereum \
     --token 0x1f9840a85d5af5bf1d1762f925bdaddc4201f984 \
     --resume
+
+# ...or name the token by symbol from the V1 registry (src/alphawallets/tokens.py).
+# 17 of the 18 pairs are priced; MKR has no DefiLlama /chart timeseries — see ADR 0008.
+uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices \
+    --chain ethereum \
+    --token-symbol AAVE \
+    --span-days 7
 
 # Prove the three schemas join: one wallet's priced UNI timeline (auto-picks a wallet)
 uv run python -m alphawallets.pipeline.exploration.wallet_activity_proof
