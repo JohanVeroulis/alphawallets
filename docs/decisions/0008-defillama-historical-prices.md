@@ -19,7 +19,7 @@ Result (2026-09-28): 52 / 52 probes returned prices. 100% coverage across all te
 Two findings that shape follow-on work:
 
 1. ARB prices are identical on both chains — DefiLlama treats the bridged Ethereum token (0xb50721bcf8d664c30412cfbc6cf7a15145234ad1) and the Arbitrum-native token (0x912ce59144191c1204e64559fe8253a0e49e6548) as the same asset, to the cent, at every date. The V1 scope choice to track ARB post-bridge (per ADR 0001) costs nothing in price accuracy.
-2. MORPHO required the correct address to resolve. The original non-transferable MORPHO token (0x9994e35db50125e0df82e4c2dde62496ce330999) has no market price. The transferable MORPHO deployed in late 2024 (0x58d97b57bb95320f9a05dc918aef65434969c2b2) is the one with a price feed. Any code that stores or queries MORPHO prices must use the transferable address.
+2. MORPHO required the correct address to resolve. The original non-transferable MORPHO token (0x9994e35db50125e0df82e4c2dde62496ce330999) has no market price. The transferable MORPHO deployed in late 2024 (0x58d97b57bb95320f9a05dc918aef65434969c2b2) is the one with a price feed. Any code that stores or queries MORPHO prices must use the transferable address. **How to tell them apart is not obvious — see the amendment below.**
 
 ## Decision
 
@@ -48,3 +48,28 @@ Concrete rules:
 - Coverage is verified only for V1 tracked tokens. Wallets in the discovered universe will hold tokens outside this list, and those are exactly where DefiLlama coverage is likelier to thin. When AW_02 (ERC-20 transfers) starts surfacing arbitrary tokens, a coverage check per token before PnL attribution is prudent, with CoinGecko as the fallback for the tail.
 - Latency at ~300 ms per lookup. Per-trade PnL over 1,000+ swaps per pool needs the batch endpoint (DefiLlama accepts comma-separated coin ids on `/prices/historical`). Batching strategy needs to check DefiLlama's rate limits before concentrating calls — the same CUPS lesson as ADR 0007, applied to a different provider.
 - The MORPHO address gotcha is a footgun. Any future code or registry that carries a MORPHO address must use the transferable one; a check in the price fetcher for the legacy address would catch a common mistake.
+
+## Amendment — 2026-10-03: how to discriminate the two MORPHO addresses
+
+Added while building the V1 token registry (`src/alphawallets/tokens.py`). The original note said to use the transferable address but not how to confirm which one you are holding. The obvious check does not work, and the method generalises to any future registry work.
+
+**The standard ERC-20 metadata check cannot distinguish them.** Probed on Ethereum at block 26,110,150:
+
+| | legacy `0x9994e35d…` | transferable `0x58d97b57…` |
+|---|---|---|
+| `symbol()` | `MORPHO` | `MORPHO` |
+| `decimals()` | 18 | 18 |
+| `totalSupply()` | 999,999,993 | 1,000,000,000 |
+
+Identical symbol, identical decimals, and supplies that differ by seven tokens in a billion. Verifying a candidate address by `symbol()` and `decimals()` — the obvious approach, and the one a token registry would naturally reach for — passes on the wrong token.
+
+**Two checks do discriminate, and they agree:**
+
+1. **`transfer()` behaviour.** An `eth_call` of `transfer(0xdead…, 0)` against the legacy token reverts with `execution reverted: UNAUTHORIZED`; against the transferable token it succeeds. This is the definitional difference, and it costs one `eth_call` with no state change and no gas.
+2. **DefiLlama coverage.** `/prices/current` returns no entry at all for the legacy address, and `$2.5554` at confidence 0.99 for the transferable one. This is the check already implied by this ADR, and it is the cheaper of the two when a price fetcher is in play anyway.
+
+**The Superchain token list ships the legacy address** as canonical MORPHO for Ethereum (chainId 1), so a registry built from that list inherits a token that can neither transfer nor be priced. The list's Base entry (`0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842`) is correct and prices normally.
+
+**Generalised rule for registry work:** `symbol()` and `decimals()` prove an address is *an* ERC-20 with the expected metadata, not that it is *the* token intended. Where a token has had multiple deployments — a non-transferable predecessor, a migration, a redeploy after an exploit — add a behavioural or market check. Price coverage is the cheapest discriminator available in this project and is already a prerequisite for PnL.
+
+One unrelated finding from the same verification pass, recorded here because the next person writing registry code will hit it: **MKR's `symbol()` returns `bytes32`, not `string`** — it predates the ERC-20 metadata convention. Decoding it with a standard string ABI raises. Generic code that iterates `symbol()` across V1 tokens needs a `bytes32` fallback.
