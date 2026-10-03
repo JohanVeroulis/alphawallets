@@ -14,7 +14,7 @@ The verification: `src/alphawallets/pipeline/exploration/defillama_coverage.py` 
 - 90 days ago (V1's outer PnL window)
 - 1 year ago
 
-Result (2026-09-28): 52 / 52 probes returned prices. 100% coverage across all tested tokens and dates. Median latency 301 ms, p95 371 ms.
+Result (2026-09-28): 52 / 52 probes returned prices. 100% coverage across all tested tokens and dates. Median latency 301 ms, p95 371 ms. **This result is scoped to the `/prices/historical` endpoint it was measured against — see the second amendment below.**
 
 Two findings that shape follow-on work:
 
@@ -73,3 +73,29 @@ Identical symbol, identical decimals, and supplies that differ by seven tokens i
 **Generalised rule for registry work:** `symbol()` and `decimals()` prove an address is *an* ERC-20 with the expected metadata, not that it is *the* token intended. Where a token has had multiple deployments — a non-transferable predecessor, a migration, a redeploy after an exploit — add a behavioural or market check. Price coverage is the cheapest discriminator available in this project and is already a prerequisite for PnL.
 
 One unrelated finding from the same verification pass, recorded here because the next person writing registry code will hit it: **MKR's `symbol()` returns `bytes32`, not `string`** — it predates the ERC-20 metadata convention. Decoding it with a standard string ABI raises. Generic code that iterates `symbol()` across V1 tokens needs a `bytes32` fallback.
+
+## Amendment — 2026-10-03: DefiLlama coverage is endpoint-specific
+
+Found during the 7-day multi-token backfill, which ran 18 verified (token, chain) pairs and came back 17/18.
+
+**The 52/52 result above was measured against `/prices/historical`**, the per-timestamp point-lookup endpoint. AW_03 fetches with **`/chart`**, the bulk timeseries endpoint, chosen because V1's access pattern is "many timestamps for a handful of tokens" (recorded in `fetchers/prices/README.md` and ADR 0009). Those are **different coverage surfaces**, and this ADR's verification method could not have detected a gap in the one we actually fetch with.
+
+MKR is such a gap. Probed on 2026-10-03:
+
+| | `/prices/current` | `/prices/historical` | `/chart` (span 168, 24 and 2) |
+|---|---|---|---|
+| **MKR** `0x9f8f72aa…` | $2032.3869 | $1939.6375 | **coin absent, 0 points** |
+| UNI (control) `0x1f9840a8…` | $9.1510 | $9.1370 | 168 / 24 / 2 points |
+| SKY `0x56072c95…` | $0.0890 | $0.0844 | 168 / 24 / 2 points |
+
+MKR is served by both point-lookup endpoints and has no `/chart` timeseries at all, at any span. UNI and SKY both work, so this is specific to MKR rather than a route-wide problem — plausibly a consequence of the MakerDAO MKR-to-SKY migration. AW_03 fails on it with `DefiLlama returned no data for ethereum:0x9f8f72aa...`.
+
+**Scope correction.** The claim this ADR establishes is: 100% coverage for the 12 V1 tracked tokens across a full year **on `/prices/historical`**. It does not establish coverage on `/chart`, which the 7-day backfill measured separately at 17/18 pairs.
+
+MKR stays in the V1 token registry. Its address is correct, it is priced by two endpoints, and AW_02 reads transfers on-chain without touching DefiLlama at all. A `/prices/historical` fallback for coins absent from `/chart` is proposed as ADR 0010, with MKR as its first use case; `/prices/historical` was already reserved for gap-fill in the prices README, so the route is in place and only the fallback logic is missing.
+
+### Method note for future coverage and registry work
+
+This is the second finding in one day where a verification passed while proving something narrower than it appeared — the first being the MORPHO address discrimination in the amendment above, where `symbol()` and `decimals()` matched on a token that could neither transfer nor be priced.
+
+Both share a shape: a single probe that looks exhaustive, measuring one property while the conclusion drawn covers another. **When verification is cheap, prefer several orthogonal checks over one apparently-exhaustive probe.** Concretely, for this project: verify a token address by metadata *and* a behavioural or market check, and verify provider coverage on *the endpoint the code calls*, not on a sibling that is easier to loop over.
