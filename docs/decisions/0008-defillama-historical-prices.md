@@ -14,12 +14,12 @@ The verification: `src/alphawallets/pipeline/exploration/defillama_coverage.py` 
 - 90 days ago (V1's outer PnL window)
 - 1 year ago
 
-Result (2026-09-28): 52 / 52 probes returned prices. 100% coverage across all tested tokens and dates. Median latency 301 ms, p95 371 ms.
+Result (2026-09-28): 52 / 52 probes returned prices. 100% coverage across all tested tokens and dates. Median latency 301 ms, p95 371 ms. **This result is scoped to the `/prices/historical` endpoint it was measured against — see the second amendment below.**
 
 Two findings that shape follow-on work:
 
 1. ARB prices are identical on both chains — DefiLlama treats the bridged Ethereum token (0xb50721bcf8d664c30412cfbc6cf7a15145234ad1) and the Arbitrum-native token (0x912ce59144191c1204e64559fe8253a0e49e6548) as the same asset, to the cent, at every date. The V1 scope choice to track ARB post-bridge (per ADR 0001) costs nothing in price accuracy.
-2. MORPHO required the correct address to resolve. The original non-transferable MORPHO token (0x9994e35db50125e0df82e4c2dde62496ce330999) has no market price. The transferable MORPHO deployed in late 2024 (0x58d97b57bb95320f9a05dc918aef65434969c2b2) is the one with a price feed. Any code that stores or queries MORPHO prices must use the transferable address.
+2. MORPHO required the correct address to resolve. The original non-transferable MORPHO token (0x9994e35db50125e0df82e4c2dde62496ce330999) has no market price. The transferable MORPHO deployed in late 2024 (0x58d97b57bb95320f9a05dc918aef65434969c2b2) is the one with a price feed. Any code that stores or queries MORPHO prices must use the transferable address. **How to tell them apart is not obvious — see the amendment below.**
 
 ## Decision
 
@@ -48,3 +48,54 @@ Concrete rules:
 - Coverage is verified only for V1 tracked tokens. Wallets in the discovered universe will hold tokens outside this list, and those are exactly where DefiLlama coverage is likelier to thin. When AW_02 (ERC-20 transfers) starts surfacing arbitrary tokens, a coverage check per token before PnL attribution is prudent, with CoinGecko as the fallback for the tail.
 - Latency at ~300 ms per lookup. Per-trade PnL over 1,000+ swaps per pool needs the batch endpoint (DefiLlama accepts comma-separated coin ids on `/prices/historical`). Batching strategy needs to check DefiLlama's rate limits before concentrating calls — the same CUPS lesson as ADR 0007, applied to a different provider.
 - The MORPHO address gotcha is a footgun. Any future code or registry that carries a MORPHO address must use the transferable one; a check in the price fetcher for the legacy address would catch a common mistake.
+
+## Amendment — 2026-10-03: how to discriminate the two MORPHO addresses
+
+Added while building the V1 token registry (`src/alphawallets/tokens.py`). The original note said to use the transferable address but not how to confirm which one you are holding. The obvious check does not work, and the method generalises to any future registry work.
+
+**The standard ERC-20 metadata check cannot distinguish them.** Probed on Ethereum at block 26,110,150:
+
+| | legacy `0x9994e35d…` | transferable `0x58d97b57…` |
+|---|---|---|
+| `symbol()` | `MORPHO` | `MORPHO` |
+| `decimals()` | 18 | 18 |
+| `totalSupply()` | 999,999,993 | 1,000,000,000 |
+
+Identical symbol, identical decimals, and supplies that differ by seven tokens in a billion. Verifying a candidate address by `symbol()` and `decimals()` — the obvious approach, and the one a token registry would naturally reach for — passes on the wrong token.
+
+**Two checks do discriminate, and they agree:**
+
+1. **`transfer()` behaviour.** An `eth_call` of `transfer(0xdead…, 0)` against the legacy token reverts with `execution reverted: UNAUTHORIZED`; against the transferable token it succeeds. This is the definitional difference, and it costs one `eth_call` with no state change and no gas.
+2. **DefiLlama coverage.** `/prices/current` returns no entry at all for the legacy address, and `$2.5554` at confidence 0.99 for the transferable one. This is the check already implied by this ADR, and it is the cheaper of the two when a price fetcher is in play anyway.
+
+**The Superchain token list ships the legacy address** as canonical MORPHO for Ethereum (chainId 1), so a registry built from that list inherits a token that can neither transfer nor be priced. The list's Base entry (`0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842`) is correct and prices normally.
+
+**Generalised rule for registry work:** `symbol()` and `decimals()` prove an address is *an* ERC-20 with the expected metadata, not that it is *the* token intended. Where a token has had multiple deployments — a non-transferable predecessor, a migration, a redeploy after an exploit — add a behavioural or market check. Price coverage is the cheapest discriminator available in this project and is already a prerequisite for PnL.
+
+One unrelated finding from the same verification pass, recorded here because the next person writing registry code will hit it: **MKR's `symbol()` returns `bytes32`, not `string`** — it predates the ERC-20 metadata convention. Decoding it with a standard string ABI raises. Generic code that iterates `symbol()` across V1 tokens needs a `bytes32` fallback.
+
+## Amendment — 2026-10-03: DefiLlama coverage is endpoint-specific
+
+Found during the 7-day multi-token backfill, which ran 18 verified (token, chain) pairs and came back 17/18.
+
+**The 52/52 result above was measured against `/prices/historical`**, the per-timestamp point-lookup endpoint. AW_03 fetches with **`/chart`**, the bulk timeseries endpoint, chosen because V1's access pattern is "many timestamps for a handful of tokens" (recorded in `fetchers/prices/README.md` and ADR 0009). Those are **different coverage surfaces**, and this ADR's verification method could not have detected a gap in the one we actually fetch with.
+
+MKR is such a gap. Probed on 2026-10-03:
+
+| | `/prices/current` | `/prices/historical` | `/chart` (span 168, 24 and 2) |
+|---|---|---|---|
+| **MKR** `0x9f8f72aa…` | $2032.3869 | $1939.6375 | **coin absent, 0 points** |
+| UNI (control) `0x1f9840a8…` | $9.1510 | $9.1370 | 168 / 24 / 2 points |
+| SKY `0x56072c95…` | $0.0890 | $0.0844 | 168 / 24 / 2 points |
+
+MKR is served by both point-lookup endpoints and has no `/chart` timeseries at all, at any span. UNI and SKY both work, so this is specific to MKR rather than a route-wide problem — plausibly a consequence of the MakerDAO MKR-to-SKY migration. AW_03 fails on it with `DefiLlama returned no data for ethereum:0x9f8f72aa...`.
+
+**Scope correction.** The claim this ADR establishes is: 100% coverage for the 12 V1 tracked tokens across a full year **on `/prices/historical`**. It does not establish coverage on `/chart`, which the 7-day backfill measured separately at 17/18 pairs.
+
+MKR stays in the V1 token registry. Its address is correct, it is priced by two endpoints, and AW_02 reads transfers on-chain without touching DefiLlama at all. A `/prices/historical` fallback for coins absent from `/chart` is proposed as ADR 0010, with MKR as its first use case; `/prices/historical` was already reserved for gap-fill in the prices README, so the route is in place and only the fallback logic is missing.
+
+### Method note for future coverage and registry work
+
+This is the second finding in one day where a verification passed while proving something narrower than it appeared — the first being the MORPHO address discrimination in the amendment above, where `symbol()` and `decimals()` matched on a token that could neither transfer nor be priced.
+
+Both share a shape: a single probe that looks exhaustive, measuring one property while the conclusion drawn covers another. **When verification is cheap, prefer several orthogonal checks over one apparently-exhaustive probe.** Concretely, for this project: verify a token address by metadata *and* a behavioural or market check, and verify provider coverage on *the endpoint the code calls*, not on a sibling that is easier to loop over.

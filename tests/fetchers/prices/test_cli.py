@@ -19,7 +19,9 @@ class TestArgParser:
     def test_minimal_valid_args(self):
         args = _build_arg_parser().parse_args(["--chain", "ethereum"])
         assert args.chain == "ethereum"
-        assert args.token == UNI
+        # No argparse default: main() applies the UNI default via _resolve_token.
+        assert args.token is None
+        assert args.token_symbol is None
         # No argparse default: main() applies DEFAULT_SPAN_DAYS, so the mutex with
         # --resume can distinguish "not passed" from "passed the default value".
         assert args.span_days is None
