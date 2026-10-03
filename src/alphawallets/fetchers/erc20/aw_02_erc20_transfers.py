@@ -41,6 +41,7 @@ from alphawallets.fetchers.erc20.writer import (
     write_decoded_transfers,
     write_raw_transfers,
 )
+from alphawallets.tokens import KNOWN_SYMBOLS, get_token_address
 
 logger = logging.getLogger(__name__)
 
@@ -237,9 +238,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Target chain (V1 scope per CLAUDE.md Section 2).",
     )
     parser.add_argument(
+        "--token-symbol",
+        default=None,
+        choices=sorted(KNOWN_SYMBOLS),
+        help=(
+            "Token symbol from the V1 registry, resolved against --chain. "
+            "Preferred over --contract. Cannot be combined with it."
+        ),
+    )
+    parser.add_argument(
         "--contract",
-        default=DEFAULT_TOKENS["UNI"],
-        help=f"ERC-20 token contract address. Default: UNI ({DEFAULT_TOKENS['UNI']}).",
+        # No argparse default: main() applies the UNI default itself, so the mutex
+        # with --token-symbol can tell "not passed" from "passed the default".
+        default=None,
+        help=f"ERC-20 token contract address. Default: UNI ({DEFAULT_TOKENS['UNI']}). "
+        "Cannot be combined with --token-symbol.",
     )
     parser.add_argument(
         "--blocks",
@@ -313,6 +326,30 @@ def get_resume_point(conn: DuckDBPyConnection, chain: str, contract_address: str
     return int(row[0])
 
 
+def _resolve_contract(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[str, str]:
+    """Resolve the target token to a contract address and a display label.
+
+    --token-symbol is resolved against --chain through the V1 registry;
+    --contract is taken as given. Neither given falls back to the UNI default,
+    preserving the behaviour every earlier invocation relied on.
+
+    Returns:
+        (contract_address, label) — the label names the symbol when one was used,
+        so the summary and the logs say which token this run was about.
+    """
+    if args.token_symbol is not None:
+        try:
+            return get_token_address(args.token_symbol, args.chain), args.token_symbol.upper()
+        except KeyError as e:
+            # UnknownTokenError and TokenNotOnChainError both carry an actionable
+            # message; argparse's exit is the right surface for a bad CLI argument.
+            parser.error(str(e).strip("\"'"))
+            raise  # unreachable: parser.error exits
+    if args.contract is not None:
+        return args.contract, "(from --contract)"
+    return DEFAULT_TOKENS["UNI"], "UNI (default)"
+
+
 def _validate_range_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Validate range args and return the effective block count for head-relative mode.
 
@@ -327,6 +364,8 @@ def _validate_range_args(args: argparse.Namespace, parser: argparse.ArgumentPars
         parser.error("--resume cannot be combined with --blocks")
     if args.resume and args.from_block is not None:
         parser.error("--resume cannot be combined with --from-block / --to-block")
+    if args.token_symbol is not None and args.contract is not None:
+        parser.error("--token-symbol cannot be combined with --contract")
     if args.from_block is not None:
         return 0
     return args.blocks if args.blocks is not None else 1000
@@ -343,6 +382,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    contract, token_label = _resolve_contract(args, parser)
+
     mode = f"head-relative ({blocks_default:,} blocks)"
     if args.from_block is not None:
         mode = "explicit range"
@@ -356,12 +397,12 @@ def main() -> None:
         if args.resume:
             with connect(args.db_path) as conn:
                 create_tables(conn)
-                resume_from = get_resume_point(conn, args.chain, args.contract)
+                resume_from = get_resume_point(conn, args.chain, contract)
             if resume_from is None:
                 logger.info(
                     "Resume: nothing stored for chain=%s contract=%s; defaulting to %d blocks",
                     args.chain,
-                    args.contract,
+                    contract,
                     blocks_default,
                 )
                 mode = f"resume — no previous data, defaulting to {blocks_default:,} blocks"
@@ -386,7 +427,8 @@ def main() -> None:
     print(
         f"AlphaWallets — ERC-20 Transfers Fetcher\n"
         f"  Chain:      {args.chain}\n"
-        f"  Contract:   {args.contract}\n"
+        f"  Token:      {token_label}\n"
+        f"  Contract:   {contract}\n"
         f"  Mode:       {mode}\n"
         f"  From block: {from_block:,}\n"
         f"  To block:   {to_block:,}\n"
@@ -394,7 +436,7 @@ def main() -> None:
 
     result = fetch_and_persist_erc20_transfers(
         chain=args.chain,
-        contract_address=args.contract,
+        contract_address=contract,
         from_block=from_block,
         to_block=to_block,
         db_path=args.db_path,

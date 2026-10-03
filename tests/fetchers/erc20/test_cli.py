@@ -23,7 +23,11 @@ class TestArgParser:
     def test_contract_defaults_to_uni(self):
         parser = _build_arg_parser()
         args = parser.parse_args(["--chain", "ethereum"])
-        assert args.contract == UNI
+        # No argparse default: main() applies the UNI default via
+        # _resolve_contract, so the mutex with --token-symbol can distinguish
+        # "not passed" from "passed the default address".
+        assert args.contract is None
+        assert args.token_symbol is None
 
     def test_contract_override(self):
         parser = _build_arg_parser()

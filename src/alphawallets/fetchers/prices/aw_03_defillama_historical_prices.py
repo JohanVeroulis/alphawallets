@@ -39,6 +39,7 @@ from alphawallets.fetchers.prices.defillama_client import chunk_plan, fetch_char
 from alphawallets.fetchers.prices.mapper import to_raw_price_point, to_token_price
 from alphawallets.fetchers.prices.models import TokenPrice
 from alphawallets.fetchers.prices.writer import create_tables, write_token_prices
+from alphawallets.tokens import KNOWN_SYMBOLS, get_token_address
 
 logger = logging.getLogger(__name__)
 
@@ -242,9 +243,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Target chain (V1 scope per CLAUDE.md Section 2).",
     )
     parser.add_argument(
+        "--token-symbol",
+        default=None,
+        choices=sorted(KNOWN_SYMBOLS),
+        help=(
+            "Token symbol from the V1 registry, resolved against --chain. "
+            "Preferred over --token. Cannot be combined with it."
+        ),
+    )
+    parser.add_argument(
         "--token",
-        default=DEFAULT_TOKENS["UNI"],
-        help=f"Token contract address. Default: UNI ({DEFAULT_TOKENS['UNI']}).",
+        # No argparse default: main() applies the UNI default itself, so the mutex
+        # with --token-symbol can tell "not passed" from "passed the default".
+        default=None,
+        help=f"Token contract address. Default: UNI ({DEFAULT_TOKENS['UNI']}). "
+        "Cannot be combined with --token-symbol.",
     )
     parser.add_argument(
         "--span-days",
@@ -284,6 +297,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_token(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[str, str]:
+    """Resolve the target token to a contract address and a display label.
+
+    --token-symbol is resolved against --chain through the V1 registry; --token
+    is taken as an address. Neither given falls back to the UNI default, so every
+    earlier invocation behaves identically.
+
+    Returns:
+        (token_address, label) — the label names the symbol when one was used, so
+        the summary says which token this run was about rather than only its hex.
+    """
+    if args.token_symbol is not None:
+        try:
+            return get_token_address(args.token_symbol, args.chain), args.token_symbol.upper()
+        except KeyError as e:
+            # UnknownTokenError and TokenNotOnChainError both carry an actionable
+            # message; argparse's exit is the right surface for a bad argument.
+            parser.error(str(e).strip("\"'"))
+            raise  # unreachable: parser.error exits
+    if args.token is not None:
+        return args.token, "(from --token)"
+    return DEFAULT_TOKENS["UNI"], "UNI (default)"
+
+
 def _validate_range_args(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -306,6 +343,8 @@ def _validate_range_args(
     """
     if args.resume and args.span_days is not None:
         parser.error("--resume cannot be combined with --span-days")
+    if args.token_symbol is not None and args.token is not None:
+        parser.error("--token-symbol cannot be combined with --token")
 
     effective = span_days if span_days is not None else args.span_days
     if effective is None:
@@ -329,9 +368,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
-    # Validate before any DB or network access, so --resume --span-days fails
+    # Validate before any DB or network access, so a bad flag combination fails
     # immediately rather than after opening the cache.
     _validate_range_args(args, parser)
+
+    token, token_label = _resolve_token(args, parser)
 
     span_days = args.span_days if args.span_days is not None else DEFAULT_SPAN_DAYS
     mode = (
@@ -343,12 +384,12 @@ def main() -> None:
     if args.resume:
         with connect(args.db_path) as conn:
             create_tables(conn)
-            resume_point = get_resume_point(conn, args.chain, args.token)
+            resume_point = get_resume_point(conn, args.chain, token)
         if resume_point is None:
             logger.info(
                 "Resume: nothing stored for chain=%s token=%s; defaulting to %d days",
                 args.chain,
-                args.token,
+                token,
                 DEFAULT_SPAN_DAYS,
             )
             span_days = DEFAULT_SPAN_DAYS
@@ -367,7 +408,8 @@ def main() -> None:
     print(
         f"AlphaWallets — DefiLlama Historical Prices\n"
         f"  Chain:  {args.chain}\n"
-        f"  Token:  {args.token}\n"
+        f"  Token:  {token_label}\n"
+        f"  Addr:   {token}\n"
         f"  Mode:   {mode}\n"
         # RUF001: the multiplication sign is intentional in user-facing output
         f"  Span:   {span_days} days × {args.period} = {total_points} points "  # noqa: RUF001
@@ -376,7 +418,7 @@ def main() -> None:
 
     result = fetch_and_persist_prices(
         chain=args.chain,
-        token_address=args.token,
+        token_address=token,
         span_days=span_days,
         period=args.period,
         db_path=args.db_path,
