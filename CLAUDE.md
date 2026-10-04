@@ -221,6 +221,8 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 
 **DuckDB operational conventions** discovered through PR #22 — the UTC session pin, the schema-drift guard, and grid-head-relative price classification — are recorded in [ADR 0009](docs/decisions/0009-duckdb-connection-and-schema-conventions.md). They were never tracked as open questions here; the ADR is their record, and it is the place to look before changing how a connection is opened, a table is created, or an unpriced event is classified.
 
+**DefiLlama price coverage is endpoint-specific.** The `/chart` route AW_03 uses covers 17 of the 18 verified (token, chain) pairs; MKR is served only by the per-timestamp endpoints. The fallback design — a cached route probe writing into the same `token_price` table — is recorded in [ADR 0010](docs/decisions/0010-defillama-historical-fallback.md), with implementation tracked as a follow-up PR. Until it lands, MKR has no stored prices and a permanently-uncovered token reads as indefinitely `pending` under ADR 0009's classification.
+
 ### Decided
 - [x] **Data source:** Alchemy free tier — see [ADR 0003](docs/decisions/0003-alchemy-over-dune.md)
 - [x] **Local cache:** DuckDB — see [ADR 0004](docs/decisions/0004-duckdb-cache.md)
