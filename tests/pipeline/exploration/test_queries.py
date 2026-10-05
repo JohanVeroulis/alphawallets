@@ -56,8 +56,37 @@ class TestPoolLayout:
     def test_pools_holding_uni(self):
         assert pools_holding_token(UNI) == [UNI_POOL]
 
-    def test_pools_holding_weth_is_both(self):
-        assert set(pools_holding_token(WETH)) == {UNI_POOL, USDC_POOL}
+    def test_pools_holding_weth_covers_every_ethereum_pool(self):
+        """WETH is the quote asset for every pool, so it spans the whole layout.
+
+        Computed from the layout rather than listed, so adding a pool cannot make
+        this assertion silently narrower than the data.
+        """
+        expected = {
+            pool
+            for pool, layout in POOL_TOKEN_LAYOUT.items()
+            if WETH in {layout["token0"]["address"], layout["token1"]["address"]}
+        }
+        assert set(pools_holding_token(WETH)) == expected
+        assert UNI_POOL in expected
+        assert USDC_POOL in expected
+
+    def test_every_pool_has_a_weth_side(self):
+        """Pair policy: TOKEN/WETH throughout, on both chains."""
+        weth = {WETH, "0x4200000000000000000000000000000000000006"}
+        for pool, layout in POOL_TOKEN_LAYOUT.items():
+            sides = {layout["token0"]["address"], layout["token1"]["address"]}
+            assert sides & weth, f"{pool} has no WETH side"
+
+    def test_one_pool_per_token_chain_pair(self):
+        """A second pool for the same token on one chain would make the layout
+        ambiguous for pools_holding_token, which returns all matches."""
+        from alphawallets.tokens import all_token_chain_pairs, get_token_address
+
+        for symbol, chain in all_token_chain_pairs():
+            address = get_token_address(symbol, chain)
+            matches = pools_holding_token(address)
+            assert len(matches) == 1, f"{symbol} on {chain} maps to {matches}"
 
     def test_pools_holding_unknown_token_is_empty(self):
         assert pools_holding_token("0x" + "7" * 40) == []
