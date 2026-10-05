@@ -85,6 +85,10 @@ uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
     --chain ethereum \
     --pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640
 
+# Pool choice: one primary pool per V1 token is configured per chain in
+# DEFAULT_ETHEREUM_POOLS / DEFAULT_BASE_POOLS. Pass any of their addresses to
+# --pool; see fetchers/uniswap_v3/README.md for the table and the pair/fee policy.
+
 # ...or continue from the highest block already stored for that pool
 uv run python -m alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps \
     --chain ethereum \
