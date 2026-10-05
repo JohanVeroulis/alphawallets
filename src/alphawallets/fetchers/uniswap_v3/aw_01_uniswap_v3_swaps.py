@@ -63,13 +63,58 @@ ABI_PATH = Path(__file__).parent / "abis" / "uniswap_v3_pool.json"
 
 # The V1 default target: Uniswap V3 USDC/WETH 0.05% pool on Ethereum.
 # See CLAUDE.md Section 2 for the tracked-pairs list.
+# One primary pool per V1 tracked token, plus the original USDC/WETH reference
+# pool. TOKEN/WETH throughout: the USDC fallback was never needed, since every
+# V1 token has a WETH pair. Fee tier is 0.3% by default, overridden per pool
+# only where a different tier measured deeper — see the note on each exception.
+#
+# Every address was verified on-chain via getPool(tokenA, tokenB, fee) and then
+# token0(), token1(), fee(), and re-verified after transcription. The matching
+# token-slot layout lives in pipeline/exploration/queries.py POOL_TOKEN_LAYOUT,
+# which carries the fee-tier methodology caveat; both are hand-written so a
+# reviewer sees either side change.
 DEFAULT_ETHEREUM_POOLS: dict[str, str] = {
-    "USDC/WETH 0.05%": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
-    # Verified live on 2026-10-01 via the V3 factory:
-    # getPool(UNI, WETH, 3000) -> this address, token0=UNI, token1=WETH, fee=3000.
-    # UNI is both a tracked DeFi token and a tracked airdrop (CLAUDE.md Section 2),
-    # so this pool is where swap, transfer and price data overlap for one asset.
-    "UNI/WETH 0.3%": "0x1d42064Fc4Beb5F8aAF85F4617AE8b3b5B8Bd801",
+    "UNI/WETH 0.3%": "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801",
+    "AAVE/WETH 0.3%": "0x5ab53ee1d50eef2c1dd3d5402789cd27bb52c1bb",
+    "LDO/WETH 0.3%": "0xa3f558aebaecaf0e11ca4b2199cc5ed341edfd74",
+    "PENDLE/WETH 0.3%": "0x57af956d3e2cca3b86f3d8c6772c03ddca3eaacb",
+    "CRV/WETH 0.3%": "0x919fa96e88d67499339577fa202345436bcdaf79",
+    "ENA/WETH 0.3%": "0xc3db44adc1fcdfd5671f555236eae49f4a8eea18",
+    # MKR trades here, but DefiLlama's /chart does not carry MKR, so its
+    # swaps classify as 'unpriceable' until ADR 0010 ships. MKR's symbol()
+    # also returns bytes32 rather than string; that affects token metadata
+    # calls, not pool metadata, so nothing here depends on it.
+    "MKR/WETH 0.3%": "0xe8c6c9227491c0a8156a0106a0204d881bb7e531",
+    # 1% rather than the 0.3% default: measured ~2x the liquidity of the
+    # 0.3% pool. MORPHO here is the TRANSFERABLE deployment (ADR 0008
+    # amendment) — the legacy address has no pool and no price.
+    "MORPHO/WETH 1%": "0x25b96761e765b9ac20db18fa57fa91e3b617ec6f",
+    "LINK/WETH 0.3%": "0xa6cc3c2531fdaa6ae1a3ca84c2855806728693e8",
+    "ARB/WETH 0.3%": "0x59354356ec5d56306791873f567d61ebf11dfbd5",
+    "EIGEN/WETH 0.3%": "0xc2c390c6cd3c4e6c2b70727d35a45e8a072f18ca",
+    "ETHFI/WETH 0.3%": "0x06f00544c0bc62e6db10f46d370dfccdc23d8189",
+    "USDC/WETH 0.05%": "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640",
+}
+
+# Base coverage follows the token registry: only the six V1 tokens with a
+# verified Base address have pools here (src/alphawallets/tokens.py).
+DEFAULT_BASE_POOLS: dict[str, str] = {
+    # 1% rather than 0.3%: the 0.3% pool exists but is ~25,000x shallower.
+    "UNI/WETH 1%": "0xab365f161dd501473a1ff0d2ef0dce94e7398839",
+    "AAVE/WETH 0.3%": "0x2e86514cfd61fb19c5cf2b879d536d273d6e693d",
+    # 1% rather than 0.3%: measured ~60x the liquidity of the 0.3% pool.
+    "CRV/WETH 1%": "0x330e535c40eb49cc186496f061052fcf814d68cb",
+    # Shallowest pool in the set (~5 orders of magnitude below its peers)
+    # and the only V3 option for PENDLE on Base; the USDC pair is thinner
+    # still. Low confidence — expect few or no swaps in a short window.
+    "PENDLE/WETH 0.3%": "0xd7042869277c75ca56f1f6cc7e18ff0d83410dee",
+    "MORPHO/WETH 0.3%": "0x2f42df4af5312b492e9d7f7b2110d9c7bf2d9e4f",
+    "LINK/WETH 0.3%": "0x224a5d3f2155f2f85af70b6d72aea61a15273ff4",
+}
+
+DEFAULT_POOLS_BY_CHAIN: dict[str, dict[str, str]] = {
+    "ethereum": DEFAULT_ETHEREUM_POOLS,
+    "base": DEFAULT_BASE_POOLS,
 }
 
 

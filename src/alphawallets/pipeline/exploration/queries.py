@@ -34,22 +34,23 @@ from alphawallets.pipeline.exploration.models import Event, classify_price_statu
 # The third is chosen: V1 tracks a handful of pools, the layout is immutable once
 # a pool is deployed, and extending the dict is a one-line change.
 #
-# Every entry below was verified live against the pool contracts on 2026-10-01 —
-# token0(), token1(), and each token's symbol() and decimals().
+# Every entry below was verified live against the pool contracts — token0(),
+# token1(), fee(), and each token's decimals() — and re-verified slot by slot
+# after transcription into this dict.
+#
+# Methodology caveat for anyone adding future pools. Fee-tier selection used
+# the pool's liquidity() value, which is a uint128 in the pool's own internal
+# units — roughly sqrt(token0 * token1) scaled by decimals. It is validly
+# comparable ACROSS FEE TIERS OF THE SAME PAIR, because those pools hold
+# identical tokens with identical decimals, and that is the only way it is used
+# here. It is NOT comparable across different pairs or different quote assets:
+# claiming one token's pool is 'deeper' than another's from these numbers is
+# meaningless, and comparing a TOKEN/WETH pool against a TOKEN/USDC pool
+# crosses both the pair and the decimals boundary. When liquidity cannot settle
+# a choice, a short smoke-test backfill is the reliable signal: whether swaps
+# actually emit is a fact, where a liquidity comparison would be an inference.
 POOL_TOKEN_LAYOUT: dict[str, dict[str, Any]] = {
-    "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": {  # USDC/WETH 0.05%
-        "token0": {
-            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-            "symbol": "USDC",
-            "decimals": 6,
-        },
-        "token1": {
-            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-            "symbol": "WETH",
-            "decimals": 18,
-        },
-    },
-    "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801": {  # UNI/WETH 0.3%
+    "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801": {  # UNI/WETH 0.3% on ethereum
         "token0": {
             "address": "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984",
             "symbol": "UNI",
@@ -61,8 +62,235 @@ POOL_TOKEN_LAYOUT: dict[str, dict[str, Any]] = {
             "decimals": 18,
         },
     },
+    "0x5ab53ee1d50eef2c1dd3d5402789cd27bb52c1bb": {  # AAVE/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9",
+            "symbol": "AAVE",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    "0xa3f558aebaecaf0e11ca4b2199cc5ed341edfd74": {  # LDO/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0x5a98fcbea516cf06857215779fd812ca3bef1b32",
+            "symbol": "LDO",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    "0x57af956d3e2cca3b86f3d8c6772c03ddca3eaacb": {  # PENDLE/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0x808507121b80c02388fad14726482e061b8da827",
+            "symbol": "PENDLE",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    "0x919fa96e88d67499339577fa202345436bcdaf79": {  # CRV/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xd533a949740bb3306d119cc777fa900ba034cd52",
+            "symbol": "CRV",
+            "decimals": 18,
+        },
+    },
+    "0xc3db44adc1fcdfd5671f555236eae49f4a8eea18": {  # ENA/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0x57e114b691db790c35207b2e685d4a43181e6061",
+            "symbol": "ENA",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    # MKR trades here, but DefiLlama's /chart does not carry MKR, so its
+    # swaps classify as 'unpriceable' until ADR 0010 ships. MKR's symbol()
+    # also returns bytes32 rather than string; that affects token metadata
+    # calls, not pool metadata, so nothing here depends on it.
+    "0xe8c6c9227491c0a8156a0106a0204d881bb7e531": {  # MKR/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2",
+            "symbol": "MKR",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    # 1% rather than the 0.3% default: measured ~2x the liquidity of the
+    # 0.3% pool. MORPHO here is the TRANSFERABLE deployment (ADR 0008
+    # amendment) — the legacy address has no pool and no price.
+    "0x25b96761e765b9ac20db18fa57fa91e3b617ec6f": {  # MORPHO/WETH 1% on ethereum
+        "token0": {
+            "address": "0x58d97b57bb95320f9a05dc918aef65434969c2b2",
+            "symbol": "MORPHO",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    "0xa6cc3c2531fdaa6ae1a3ca84c2855806728693e8": {  # LINK/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0x514910771af9ca656af840dff83e8264ecf986ca",
+            "symbol": "LINK",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    "0x59354356ec5d56306791873f567d61ebf11dfbd5": {  # ARB/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0xb50721bcf8d664c30412cfbc6cf7a15145234ad1",
+            "symbol": "ARB",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    "0xc2c390c6cd3c4e6c2b70727d35a45e8a072f18ca": {  # EIGEN/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xec53bf9167f50cdeb3ae105f56099aaab9061f83",
+            "symbol": "EIGEN",
+            "decimals": 18,
+        },
+    },
+    "0x06f00544c0bc62e6db10f46d370dfccdc23d8189": {  # ETHFI/WETH 0.3% on ethereum
+        "token0": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xfe0c30065b384f05761f15d0cc899d4f9f9cc0eb",
+            "symbol": "ETHFI",
+            "decimals": 18,
+        },
+    },
+    "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640": {  # USDC/WETH 0.05% on ethereum
+        "token0": {
+            "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+            "symbol": "USDC",
+            "decimals": 6,
+        },
+        "token1": {
+            "address": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+    },
+    # 1% rather than 0.3%: the 0.3% pool exists but is ~25,000x shallower.
+    "0xab365f161dd501473a1ff0d2ef0dce94e7398839": {  # UNI/WETH 1% on base
+        "token0": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xc3de830ea07524a0761646a6a4e4be0e114a3c83",
+            "symbol": "UNI",
+            "decimals": 18,
+        },
+    },
+    "0x2e86514cfd61fb19c5cf2b879d536d273d6e693d": {  # AAVE/WETH 0.3% on base
+        "token0": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0x63706e401c06ac8513145b7687a14804d17f814b",
+            "symbol": "AAVE",
+            "decimals": 18,
+        },
+    },
+    # 1% rather than 0.3%: measured ~60x the liquidity of the 0.3% pool.
+    "0x330e535c40eb49cc186496f061052fcf814d68cb": {  # CRV/WETH 1% on base
+        "token0": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0x8ee73c484a26e0a5df2ee2a4960b789967dd0415",
+            "symbol": "CRV",
+            "decimals": 18,
+        },
+    },
+    # Shallowest pool in the set (~5 orders of magnitude below its peers)
+    # and the only V3 option for PENDLE on Base; the USDC pair is thinner
+    # still. Low confidence — expect few or no swaps in a short window.
+    "0xd7042869277c75ca56f1f6cc7e18ff0d83410dee": {  # PENDLE/WETH 0.3% on base
+        "token0": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xa99f6e6785da0f5d6fb42495fe424bce029eeb3e",
+            "symbol": "PENDLE",
+            "decimals": 18,
+        },
+    },
+    "0x2f42df4af5312b492e9d7f7b2110d9c7bf2d9e4f": {  # MORPHO/WETH 0.3% on base
+        "token0": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842",
+            "symbol": "MORPHO",
+            "decimals": 18,
+        },
+    },
+    "0x224a5d3f2155f2f85af70b6d72aea61a15273ff4": {  # LINK/WETH 0.3% on base
+        "token0": {
+            "address": "0x4200000000000000000000000000000000000006",
+            "symbol": "WETH",
+            "decimals": 18,
+        },
+        "token1": {
+            "address": "0x88fb150bdc53a65fe94dea0c9ba0a6daf8c6e196",
+            "symbol": "LINK",
+            "decimals": 18,
+        },
+    },
 }
-
 
 # ---------- Layout helpers ----------
 
