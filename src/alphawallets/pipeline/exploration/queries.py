@@ -410,6 +410,7 @@ def assemble_timeline(
     transfers: list[dict[str, Any]],
     prices_by_hour: dict[datetime, float],
     price_grid_head: datetime | None = None,
+    is_unpriceable: bool = False,
 ) -> list[Event]:
     """Turn raw query results into one chronological, priced Event list.
 
@@ -419,6 +420,8 @@ def assemble_timeline(
         prices_by_hour: Mapping from query_prices_for_hours.
         price_grid_head: Newest priced hour for this (chain, token), from
             query_price_grid_head. None means the token has no prices at all.
+        is_unpriceable: Whether no configured price route can serve this token.
+            Applies to the whole timeline, since it is a property of the token.
 
     Returns:
         Events sorted by timestamp, each classified priced / pending /
@@ -436,6 +439,7 @@ def assemble_timeline(
                 tx_hash=swap["tx_hash"],
                 prices_by_hour=prices_by_hour,
                 price_grid_head=price_grid_head,
+                is_unpriceable=is_unpriceable,
                 other_amount=swap["other_amount"],
                 other_token=swap["other_token"],
             )
@@ -451,6 +455,7 @@ def assemble_timeline(
                 tx_hash=transfer["tx_hash"],
                 prices_by_hour=prices_by_hour,
                 price_grid_head=price_grid_head,
+                is_unpriceable=is_unpriceable,
                 counterparty=transfer["counterparty"],
                 amount_approximate=transfer["decimals_assumed"],
             )
@@ -470,13 +475,17 @@ def _build_event(
     tx_hash: str,
     prices_by_hour: dict[datetime, float],
     price_grid_head: datetime | None,
+    is_unpriceable: bool,
     **extra: Any,
 ) -> Event:
     """Build one Event, resolving its price and status from the hour grid."""
     hour = hour_of(ts)
-    price = prices_by_hour.get(hour)
+    price = None if is_unpriceable else prices_by_hour.get(hour)
     status = classify_price_status(
-        hour, has_price_row=price is not None, price_grid_head=price_grid_head
+        hour,
+        has_price_row=price is not None,
+        price_grid_head=price_grid_head,
+        is_unpriceable=is_unpriceable,
     )
     return Event(
         ts=ts,

@@ -243,21 +243,23 @@ class TestConstants:
 class TestTimelineSummary:
     def test_construction_and_derived_properties(self):
         summary = TimelineSummary(
-            total=10, swaps=4, transfers=6, priced=7, pending=3, unavailable=0
+            total=10, swaps=4, transfers=6, priced=7, pending=3, unavailable=0, unpriceable=0
         )
         assert summary.covered_range_events == 7
         assert summary.coverage_pct == 100.0
         assert summary.is_fully_priced is True
 
     def test_frozen(self):
-        summary = TimelineSummary(total=1, swaps=1, transfers=0, priced=1, pending=0, unavailable=0)
+        summary = TimelineSummary(
+            total=1, swaps=1, transfers=0, priced=1, pending=0, unavailable=0, unpriceable=0
+        )
         with pytest.raises(ValidationError):
             summary.priced = 99
 
     def test_pending_excluded_from_the_denominator(self):
         """The whole point: provider lag must not read as falling coverage."""
         summary = TimelineSummary(
-            total=50, swaps=50, transfers=0, priced=43, pending=7, unavailable=0
+            total=50, swaps=50, transfers=0, priced=43, pending=7, unavailable=0, unpriceable=0
         )
         assert summary.covered_range_events == 43
         assert summary.coverage_pct == 100.0
@@ -266,23 +268,29 @@ class TestTimelineSummary:
     def test_unavailable_breaks_full_pricing(self):
         """A single hole inside the covered range is a real signal."""
         summary = TimelineSummary(
-            total=50, swaps=50, transfers=0, priced=42, pending=7, unavailable=1
+            total=50, swaps=50, transfers=0, priced=42, pending=7, unavailable=1, unpriceable=0
         )
         assert summary.covered_range_events == 43
         assert summary.coverage_pct == pytest.approx(97.67, abs=0.01)
         assert summary.is_fully_priced is False
 
     def test_all_pending_is_not_a_division_by_zero(self):
-        summary = TimelineSummary(total=3, swaps=0, transfers=3, priced=0, pending=3, unavailable=0)
+        summary = TimelineSummary(
+            total=3, swaps=0, transfers=3, priced=0, pending=3, unavailable=0, unpriceable=0
+        )
         assert summary.covered_range_events == 0
         assert summary.coverage_pct == 100.0
 
     def test_negative_counters_rejected(self):
         with pytest.raises(ValidationError):
-            TimelineSummary(total=1, swaps=1, transfers=0, priced=-1, pending=0, unavailable=0)
+            TimelineSummary(
+                total=1, swaps=1, transfers=0, priced=-1, pending=0, unavailable=0, unpriceable=0
+            )
 
     def test_hour_lists_default_to_empty(self):
-        summary = TimelineSummary(total=0, swaps=0, transfers=0, priced=0, pending=0, unavailable=0)
+        summary = TimelineSummary(
+            total=0, swaps=0, transfers=0, priced=0, pending=0, unavailable=0, unpriceable=0
+        )
         assert summary.unavailable_hours == []
         assert summary.pending_hours == []
         assert summary.price_grid_head is None
@@ -593,3 +601,176 @@ class TestCliMain:
         )
         assert main() == 1
         assert "No events for wallet" in capsys.readouterr().out
+
+
+class TestUnpriceableState:
+    """The fourth state: a token no configured price route can serve.
+
+    Without it, a route-less token never acquires a grid head, so the grid-head
+    rule labels every one of its events 'pending' forever — indistinguishable
+    from a backfill that has not run. See ADR 0010.
+    """
+
+    def test_event_accepts_unpriceable(self):
+        event = make_event(price_status="unpriceable", price_usd=None)
+        assert event.price_status == "unpriceable"
+        assert event.value_usd is None
+
+    def test_unpriceable_with_price_rejected(self):
+        """Same invariant as pending and unavailable: no status but 'priced' may
+        carry a price, or coverage counts become meaningless."""
+        with pytest.raises(ValidationError, match="must not carry a price_usd"):
+            make_event(price_status="unpriceable", price_usd=8.94)
+
+    def test_classifier_short_circuits_before_everything_else(self):
+        assert (
+            classify_price_status(
+                PAST_HOUR, has_price_row=False, price_grid_head=HEAD, is_unpriceable=True
+            )
+            == "unpriceable"
+        )
+
+    def test_short_circuit_beats_a_cached_price_row(self):
+        """A stray row — a fixture, or a route since withdrawn — must not override.
+
+        The classification describes what the fetcher can cover, not what happens
+        to be in the cache.
+        """
+        assert (
+            classify_price_status(
+                PAST_HOUR, has_price_row=True, price_grid_head=HEAD, is_unpriceable=True
+            )
+            == "unpriceable"
+        )
+
+    def test_short_circuit_beats_pending(self):
+        above = HEAD + timedelta(hours=1)
+        assert (
+            classify_price_status(
+                above, has_price_row=False, price_grid_head=HEAD, is_unpriceable=True
+            )
+            == "unpriceable"
+        )
+
+    def test_short_circuit_beats_a_none_grid_head(self):
+        """The exact case the state exists for: no prices at all for the token."""
+        assert (
+            classify_price_status(
+                PAST_HOUR, has_price_row=False, price_grid_head=None, is_unpriceable=True
+            )
+            == "unpriceable"
+        )
+
+    def test_defaults_to_false_so_existing_behaviour_is_unchanged(self):
+        assert (
+            classify_price_status(PAST_HOUR, has_price_row=False, price_grid_head=None) == "pending"
+        )
+
+    def test_summary_counts_the_bucket(self):
+        events = [
+            make_event(price_status="unpriceable", price_usd=None),
+            make_event(price_status="unpriceable", price_usd=None),
+        ]
+        summary = summarise(events)
+        assert summary.unpriceable == 2
+        assert summary.total == 2
+
+    def test_unpriceable_excluded_from_the_coverage_denominator(self):
+        """A legitimate skip, like pending — not a miss."""
+        summary = TimelineSummary(
+            total=10, swaps=0, transfers=10, priced=4, pending=0, unavailable=0, unpriceable=6
+        )
+        assert summary.covered_range_events == 4
+        assert summary.coverage_pct == 100.0
+        assert summary.is_fully_priced is True
+
+    def test_all_unpriceable_is_not_a_division_by_zero(self):
+        summary = TimelineSummary(
+            total=3, swaps=0, transfers=3, priced=0, pending=0, unavailable=0, unpriceable=3
+        )
+        assert summary.covered_range_events == 0
+        assert summary.coverage_pct == 100.0
+
+    def test_unavailable_still_breaks_full_pricing_alongside_unpriceable(self):
+        """Mixing the two must not let a real hole hide behind a legitimate skip."""
+        summary = TimelineSummary(
+            total=10, swaps=0, transfers=10, priced=4, pending=0, unavailable=1, unpriceable=5
+        )
+        assert summary.is_fully_priced is False
+
+    def test_negative_counter_rejected(self):
+        with pytest.raises(ValidationError):
+            TimelineSummary(
+                total=1, swaps=1, transfers=0, priced=1, pending=0, unavailable=0, unpriceable=-1
+            )
+
+    def test_timeline_classifies_a_route_less_token(self, cache):
+        """End to end: the orchestrator resolves the flag from the token itself."""
+        mkr = "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2"
+        cache.execute(
+            "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                "ethereum",
+                26094728,
+                FIXTURE_H05 + timedelta(minutes=5),
+                "0x" + "e" * 64,
+                1,
+                "0xmkr:1",
+                mkr,
+                WALLET,
+                "0x" + "3" * 40,
+                str(10**18),
+                18,
+            ],
+        )
+        events, summary = build_wallet_timeline(cache, WALLET, "ethereum", mkr)
+        assert summary.total == 1
+        assert summary.unpriceable == 1
+        assert events[0].price_status == "unpriceable"
+        assert events[0].price_usd is None
+        assert summary.coverage_pct == 100.0
+
+    def test_priced_token_unaffected(self, cache):
+        """Regression: the three-state behaviour on a normal token is untouched."""
+        _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
+        assert summary.unpriceable == 0
+        assert (summary.priced, summary.pending, summary.unavailable) == (3, 1, 2)
+
+    def test_formatter_shows_the_counter(self, cache):
+        events = [make_event(price_status="unpriceable", price_usd=None)]
+        summary = summarise(events)
+        rendered = format_timeline(events, summary, WALLET, "ethereum", UNI)
+        assert "Unpriceable: 1" in rendered
+
+    def test_formatter_note_is_informational_not_a_warning(self, cache):
+        """Distinct from the unavailable warning: nothing is wrong and there is no
+        action to take until ADR 0010 lands."""
+        events = [make_event(price_status="unpriceable", price_usd=None)]
+        summary = summarise(events)
+        rendered = format_timeline(events, summary, WALLET, "ethereum", UNI)
+        assert "Note:" in rendered
+        assert "Warning:" not in rendered
+        assert "re-running AW_03 will not" in rendered
+        assert "ADR 0010" in rendered
+
+    def test_formatter_row_shows_unpriceable_in_the_price_column(self):
+        event = make_event(price_status="unpriceable", price_usd=None)
+        assert "@ unpriceable" in format_event_line(event, "MKR")
+
+    def test_registry_token_renders_its_symbol(self):
+        """MKR is not in any tracked pool, so the layout alone showed "token"."""
+        from alphawallets.pipeline.exploration.wallet_activity_proof import _token_symbol
+
+        assert _token_symbol("0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2") == "MKR"
+        assert _token_symbol("0x5a98fcbea516cf06857215779fd812ca3bef1b32") == "LDO"
+
+    def test_pool_only_token_still_resolves(self):
+        """WETH is in the pool layout but not the V1 registry."""
+        from alphawallets.pipeline.exploration.wallet_activity_proof import _token_symbol
+
+        assert _token_symbol("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2") == "WETH"
+
+    def test_unknown_token_falls_back(self):
+        from alphawallets.pipeline.exploration.wallet_activity_proof import _token_symbol
+
+        assert _token_symbol("0x" + "7" * 40) == "token"
