@@ -37,6 +37,8 @@ from alphawallets.pipeline.exploration.queries import (
     query_wallet_swaps,
     query_wallet_transfers,
 )
+from alphawallets.tokens import V1_TOKENS
+from alphawallets.unpriceable import is_unpriceable
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +48,11 @@ class TimelineSummary(BaseModel):
 
     Its own model so the coverage arithmetic lives in exactly one place. The
     denominator for coverage is covered-range events only — priced plus
-    unavailable — because an event above the price grid's head has no price to be
-    missing yet. Including it would report the provider's publishing lag as
-    falling coverage, every run, forever.
+    unavailable. Both of the other states are legitimate skips rather than
+    failures: an event above the price grid's head has no price to be missing
+    yet, and an event on a route-less token never will have one. Counting either
+    would report a provider characteristic as falling coverage, every run,
+    forever. Only unavailable is a real gap.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -60,6 +64,9 @@ class TimelineSummary(BaseModel):
     pending: int = Field(ge=0, description="Events in the current incomplete hour")
     unavailable: int = Field(
         ge=0, description="Events at or below the grid head with no price row — a real hole"
+    )
+    unpriceable: int = Field(
+        ge=0, description="Events on a token no configured price route can serve"
     )
     price_grid_head: datetime | None = Field(
         default=None,
@@ -76,7 +83,11 @@ class TimelineSummary(BaseModel):
 
     @property
     def covered_range_events(self) -> int:
-        """Events at or below the grid head, where a price could legitimately exist."""
+        """Events where a price could legitimately exist.
+
+        Excludes pending (the backfill has not reached their hour) and
+        unpriceable (no route can serve their token) — neither is a miss.
+        """
         return self.priced + self.unavailable
 
     @property
@@ -111,7 +122,12 @@ def summarise(
         A frozen summary, with the sorted lists of hours that are pending and of
         hours that are genuinely missing a price.
     """
-    by_status: dict[str, list[Event]] = {"priced": [], "pending": [], "unavailable": []}
+    by_status: dict[str, list[Event]] = {
+        "priced": [],
+        "pending": [],
+        "unavailable": [],
+        "unpriceable": [],
+    }
     for event in events:
         by_status[event.price_status].append(event)
 
@@ -122,6 +138,7 @@ def summarise(
         priced=len(by_status["priced"]),
         pending=len(by_status["pending"]),
         unavailable=len(by_status["unavailable"]),
+        unpriceable=len(by_status["unpriceable"]),
         price_grid_head=price_grid_head,
         pending_hours=sorted({_hour(e.ts) for e in by_status["pending"]}),
         unavailable_hours=sorted({_hour(e.ts) for e in by_status["unavailable"]}),
@@ -166,7 +183,23 @@ def build_wallet_timeline(
     # classification depends on cached data rather than on the wall clock.
     grid_head = query_price_grid_head(conn, chain, token_address)
 
-    events = assemble_timeline(swaps, transfers, prices_by_hour, price_grid_head=grid_head)
+    # A property of the token, not of any one event, so resolved once.
+    unpriceable = is_unpriceable(chain, token_address)
+    if unpriceable:
+        logger.info(
+            "No configured price route serves chain=%s token=%s; "
+            "classifying its events as unpriceable (see ADR 0010)",
+            chain,
+            token_address,
+        )
+
+    events = assemble_timeline(
+        swaps,
+        transfers,
+        prices_by_hour,
+        price_grid_head=grid_head,
+        is_unpriceable=unpriceable,
+    )
     return events, summarise(events, price_grid_head=grid_head)
 
 
@@ -179,11 +212,19 @@ def _short(address: str) -> str:
 
 
 def _token_symbol(token_address: str) -> str:
-    """Look up a token's symbol from the verified pool layout, or fall back.
+    """Look up a token's symbol for display, or fall back to a neutral label.
+
+    Checks the V1 registry first, then the verified pool layout — the registry
+    covers every tracked token while the layout only knows the ones sitting in a
+    tracked pool. Without the registry a timeline for MKR rendered its amounts as
+    "0.81 token", which reads as a defect to anyone opening the output.
 
     Display only — nothing joins on the symbol.
     """
     token = token_address.lower()
+    for symbol, addresses in V1_TOKENS.items():
+        if token in addresses.values():
+            return symbol
     for layout in POOL_TOKEN_LAYOUT.values():
         for slot in ("token0", "token1"):
             if layout[slot]["address"] == token:
@@ -264,6 +305,7 @@ def format_timeline(
     if summary.unavailable_hours:
         hours = ", ".join(_hour_label(h) for h in summary.unavailable_hours)
         coverage += f" [{hours}]"
+    coverage += f"   Unpriceable: {summary.unpriceable}"
     lines.append(coverage)
 
     head_label = (
@@ -273,7 +315,18 @@ def format_timeline(
     )
     lines.append(f"Price grid head: {head_label}")
 
-    if summary.pending:
+    if summary.unpriceable:
+        lines += [
+            "",
+            f"Note: all {summary.unpriceable} event(s) are on a token no configured price "
+            "route can serve, so no",
+            "      price exists for them on any hour. This is not a backfill gap and "
+            "re-running AW_03 will not",
+            "      help — the fallback route is designed in ADR 0010 and not yet "
+            "implemented. Coverage above",
+            "      counts only events a price could exist for.",
+        ]
+    elif summary.pending:
         if summary.price_grid_head is None:
             lines += [
                 "",

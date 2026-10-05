@@ -28,7 +28,7 @@ UNI_ETHEREUM = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
 
 EventType = Literal["swap", "transfer"]
 Direction = Literal["in", "out", "sell", "buy"]
-PriceStatus = Literal["priced", "pending", "unavailable"]
+PriceStatus = Literal["priced", "pending", "unavailable", "unpriceable"]
 
 # Which directions each event type is allowed to carry. A transfer moves tokens
 # in or out of the wallet; a swap exchanges them, so it buys or sells.
@@ -36,6 +36,10 @@ _DIRECTIONS_BY_TYPE: dict[str, set[str]] = {
     "transfer": {"in", "out"},
     "swap": {"buy", "sell"},
 }
+
+# Every status other than 'priced' asserts that no price exists, so none of them
+# may carry one. Kept as a set so adding a status cannot forget the check.
+_UNPRICED_STATUSES: frozenset[str] = frozenset({"pending", "unavailable", "unpriceable"})
 
 
 class Event(BaseModel):
@@ -130,10 +134,10 @@ class Event(BaseModel):
         price = data.get("price_usd")
         if status == "priced" and price is None:
             raise ValueError("price_status='priced' requires a price_usd")
-        if status in {"pending", "unavailable"} and price is not None:
+        if status in _UNPRICED_STATUSES and price is not None:
             raise ValueError(
                 f"price_status={status!r} must not carry a price_usd, got {price!r}. "
-                "A priced event is 'priced'; the other two mean no price exists."
+                "A priced event is 'priced'; every other status means no price exists."
             )
 
         # Derive value_usd once, here, so no caller has to remember that a
@@ -150,8 +154,19 @@ def classify_price_status(
     event_hour: datetime,
     has_price_row: bool,
     price_grid_head: datetime | None,
+    is_unpriceable: bool = False,
 ) -> PriceStatus:
-    """Decide whether an unpriced event is provider lag or a real backfill hole.
+    """Classify an event's price coverage into one of four states.
+
+    'unpriceable' short-circuits everything else: when no configured route can
+    serve a token, its grid head is permanently None, so the grid-head rule below
+    would label every one of its events 'pending' forever — indistinguishable
+    from a backfill that simply has not run. That erodes what 'pending' means and
+    leaves 'unavailable' unable to separate a route gap from a real hole. See
+    ADR 0010.
+
+    For everything else, the question is whether an unpriced event is provider
+    lag or a real backfill hole.
 
     Keyed off the price grid's own head — MAX(token_price.ts) for that
     (chain, token) — rather than the wall clock. The first live run showed why:
@@ -177,10 +192,19 @@ def classify_price_status(
         has_price_row: Whether token_price had a row for that hour.
         price_grid_head: Newest priced hour for this (chain, token), or None when
             the token has no prices at all.
+        is_unpriceable: Whether no configured price route can serve this token,
+            from unpriceable.is_unpriceable.
 
     Returns:
-        'priced', 'pending', or 'unavailable'.
+        'unpriceable', 'priced', 'pending', or 'unavailable'.
     """
+    # Checked before has_price_row on purpose: a listed token with a stray price
+    # row — a hand-inserted fixture, or a row from a route since withdrawn — is
+    # still a token the fetcher cannot cover, and the classification should say so
+    # rather than depend on what happens to be cached.
+    if is_unpriceable:
+        return "unpriceable"
+
     if has_price_row:
         return "priced"
 
