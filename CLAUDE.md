@@ -225,6 +225,8 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 
 **DuckDB operational conventions** discovered through PR #22 — the UTC session pin, the schema-drift guard, and grid-head-relative price classification — are recorded in [ADR 0009](docs/decisions/0009-duckdb-connection-and-schema-conventions.md). They were never tracked as open questions here; the ADR is their record, and it is the place to look before changing how a connection is opened, a table is created, or an unpriced event is classified.
 
+**PnL methodology is decided.** Ten interdependent decisions — FIFO cost basis, transfer-IN priced at receipt rather than zero, transfer-OUT ending tracking without realizing, airdrop separation by distribution contract, running cost basis sliced by realization time, and three caveat flags that surface limitations instead of excluding wallets — are recorded in [ADR 0012](docs/decisions/0012-pnl-methodology.md), with the `wallet_pnl` schema. This supersedes the provisional "PnL methodology" and "transfer treatment" entries below. Implementation lands in `pipeline/pnl/` (not an `AW_*` module, per Section 6) as a follow-up PR.
+
 **Backfill cost is chain-asymmetric.** Base is roughly 18x more expensive to backfill than Ethereum — ~6x more `eth_getLogs` windows per wall-clock minute (2s block time against ADR 0006's 10-block cap) and ~3x slower Transfers API pages. Pagination within a `(token, chain)` pair cannot be parallelised, so the design response is concurrency across pairs with per-chain DuckDB files and per-chain CUPS budgets: [ADR 0011](docs/decisions/0011-chain-aware-backfill-parallelization.md), implementation tracked as a follow-up PR. Until it lands the cache is one file, backfills are serial, and mid-run progress is unreadable because the writer holds the lock.
 
 **Price coverage classification is four-state.** `priced` / `pending` / `unavailable` / `unpriceable`, with only `unavailable` representing a real gap. The fourth state closes the Week 3 awareness item raised in PR #25: a token no route can serve never acquires a grid head, so without it every such event read as indefinitely `pending`. Source is `src/alphawallets/unpriceable.py` until ADR 0010's route cache lands. See `pipeline/exploration/README.md` for the table.
@@ -241,7 +243,7 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 
 ### Provisional (validate in Weeks 1–3 with real data)
 
-- [~] **PnL methodology:** realized PnL with FIFO cost basis for V1; unrealized PnL in V1.5.
+- [x] **PnL methodology:** realized PnL with FIFO cost basis for V1; unrealized PnL in V1.5. No longer provisional — the full methodology, including transfer treatment and the airdrop split, is decided in [ADR 0012](docs/decisions/0012-pnl-methodology.md).
 
 - [~] **"Consistently profitable":** at least 10 trades in the window, positive net PnL, activity within the last 30 days.
 
