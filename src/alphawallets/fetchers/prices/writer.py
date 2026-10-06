@@ -3,7 +3,13 @@
 One table, `token_price`, holding hour-aligned USD prices joined by the PnL
 pipeline on date_trunc('hour', block_timestamp).
 
-Primary key: (chain, token_address, ts, source) — four columns.
+Primary key: (chain, token_address, ts, source) — four columns. The `route`
+column records which DefiLlama endpoint produced a row ('chart' or 'historical',
+per ADR 0010) and is deliberately NOT in the key: a token has one authoritative
+price per hour, not one per route, so route is forensic rather than canonical.
+Putting it in the key would permit two prices for one hour and push the choice
+downstream. `source` stays 'defillama' for both routes, because source separates
+providers (CoinGecko's reserved seat) rather than routes.
 
     `source` is in the key on purpose. DefiLlama covers every V1 token today
     (ADR 0008), but a fallback provider is explicitly reserved for tokens
@@ -57,6 +63,7 @@ CREATE TABLE IF NOT EXISTS token_price (
     price_usd      DOUBLE      NOT NULL,
     confidence     DOUBLE,
     source         VARCHAR     NOT NULL DEFAULT 'defillama',
+    route          VARCHAR     NOT NULL DEFAULT 'chart',
     fetched_at     TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (chain, token_address, ts, source)
 );
@@ -74,6 +81,7 @@ TOKEN_PRICE_COLUMNS: list[tuple[str, str]] = [
     ("price_usd", "DOUBLE"),
     ("confidence", "DOUBLE"),
     ("source", "VARCHAR"),
+    ("route", "VARCHAR"),
     ("fetched_at", "TIMESTAMPTZ"),
 ]
 
@@ -100,7 +108,11 @@ def _row_count(conn: DuckDBPyConnection) -> int:
     return int(result[0])
 
 
-def write_token_prices(conn: DuckDBPyConnection, prices: list[TokenPrice]) -> int:
+def write_token_prices(
+    conn: DuckDBPyConnection,
+    prices: list[TokenPrice],
+    route: str = "chart",
+) -> int:
     """Insert price rows with INSERT OR IGNORE. Returns rows actually inserted.
 
     Idempotent: re-running with overlapping data inserts only new rows. Two
@@ -111,6 +123,9 @@ def write_token_prices(conn: DuckDBPyConnection, prices: list[TokenPrice]) -> in
     Args:
         conn: An open DuckDB connection with the table created.
         prices: Hour-aligned TokenPrice rows.
+        route: Which endpoint produced these rows — 'chart' or 'historical'.
+            Stored as metadata so the provenance of a price is answerable after
+            the fact; see the module docstring for why it is not in the key.
 
     Returns:
         The number of rows actually inserted.
@@ -127,19 +142,21 @@ def write_token_prices(conn: DuckDBPyConnection, prices: list[TokenPrice]) -> in
             price.price_usd,
             price.confidence,
             price.source,
+            route,
             price.fetched_at,
         )
         for price in prices
     ]
     conn.executemany(
-        "INSERT OR IGNORE INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     inserted = _row_count(conn) - before
     logger.info(
-        "token_price: %d rows submitted, %d inserted, %d skipped as duplicates",
+        "token_price: %d rows submitted, %d inserted, %d skipped as duplicates (route=%s)",
         len(prices),
         inserted,
         len(prices) - inserted,
+        route,
     )
     return inserted

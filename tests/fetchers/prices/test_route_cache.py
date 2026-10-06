@@ -179,3 +179,20 @@ class TestAllRoutes:
     def test_carries_route_and_timestamp(self, conn):
         set_route(conn, "ethereum", MKR, "historical", verified_at=NOW)
         assert all_routes(conn) == [("ethereum", MKR, "historical", NOW)]
+
+
+class TestMissingTable:
+    """A pipeline stage must not fail because a fetcher has not run yet."""
+
+    def test_get_route_on_a_cache_without_the_table_is_none(self):
+        with connect(":memory:") as c:
+            assert get_route(c, "ethereum", MKR) is None
+
+    def test_that_is_the_same_answer_as_unprobed(self):
+        """So downstream code needs no special case for an old cache file."""
+        with connect(":memory:") as missing:
+            without_table = get_route(missing, "ethereum", MKR)
+        with connect(":memory:") as present:
+            create_tables(present)
+            with_table = get_route(present, "ethereum", MKR)
+        assert without_table == with_table is None

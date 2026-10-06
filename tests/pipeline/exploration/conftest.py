@@ -13,6 +13,7 @@ import pytest
 
 from alphawallets.db import connect
 from alphawallets.fetchers.erc20.writer import create_tables as create_erc20_tables
+from alphawallets.fetchers.prices.route_cache import create_tables as create_route_tables
 from alphawallets.fetchers.prices.writer import create_tables as create_price_tables
 from alphawallets.fetchers.uniswap_v3.writer import create_tables as create_swap_tables
 
@@ -94,6 +95,7 @@ def cache():
         create_swap_tables(conn)
         create_erc20_tables(conn)
         create_price_tables(conn)
+        create_route_tables(conn)
 
         def add_swap(ts, tx, log_index, pool, amount0, amount1, tx_from=WALLET, chain="ethereum"):
             conn.execute(
@@ -146,8 +148,8 @@ def cache():
 
         def add_price(ts, price, token=UNI, chain="ethereum"):
             conn.execute(
-                "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
-                [chain, token, ts, price, 0.99, "defillama", GRID_HEAD],
+                "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [chain, token, ts, price, 0.99, "defillama", "chart", GRID_HEAD],
             )
 
         # --- the wallet's own activity ---

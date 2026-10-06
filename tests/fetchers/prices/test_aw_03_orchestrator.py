@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from alphawallets.db import connect
+from alphawallets.fetchers.prices import route_cache
 from alphawallets.fetchers.prices.aw_03_defillama_historical_prices import (
     FetchResult,
     fetch_and_persist_prices,
@@ -30,6 +31,7 @@ CID = f"ethereum:{UNI}"
 def _response(entries: list[dict]) -> MagicMock:
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = 200
+    resp.headers = {}
     resp.raise_for_status.return_value = None
     resp.json.return_value = {
         "coins": {
@@ -45,8 +47,30 @@ def _response(entries: list[dict]) -> MagicMock:
 
 
 def _client(*pages: list[dict]) -> MagicMock:
+    """A client that serves the given pages, then repeats the last one.
+
+    The orchestrator now probes /chart for route coverage before fetching
+    (ADR 0010), so the call count is one higher than the page count. Repeating
+    the final page rather than exhausting keeps these tests about mapping,
+    collisions and idempotency instead of about the probe — the probe has its own
+    tests in TestRouteSelection.
+    """
     client = MagicMock(spec=httpx.Client)
-    client.get.side_effect = [_response(p) for p in pages]
+    responses = [_response(p) for p in pages]
+
+    def _get(*_args, **kwargs):
+        # The probe asks for span=2; serve it the first page so it verdicts
+        # 'chart', then hand out the pages in order for the real fetch.
+        if kwargs.get("params", {}).get("span") == 2:
+            return responses[0]
+        if _get.index < len(responses):
+            response = responses[_get.index]
+            _get.index += 1
+            return response
+        return responses[-1]
+
+    _get.index = 0
+    client.get.side_effect = _get
     return client
 
 
@@ -145,7 +169,9 @@ class TestFetchAndPersistPrices:
             client=client,
         )
         assert result.chunks_fetched == 2
-        assert client.get.call_count == 2
+        # 3 calls, not 2: the route-coverage probe (ADR 0010) precedes the two
+        # chunk fetches. chunks_fetched counts chunks, not HTTP calls.
+        assert client.get.call_count == 3
         assert result.raw_points_seen == len(first) + len(second)
 
     def test_address_lowercased_in_result(self, tmp_path):
@@ -319,3 +345,168 @@ class TestValidation:
         assert result.raw_points_seen == 2
         assert result.mapped == 1
         assert result.written == 1
+
+
+class TestRouteSelection:
+    """The ADR 0010 discovery flow: probe once, remember, then use the verdict."""
+
+    @staticmethod
+    def _empty_chart_client() -> MagicMock:
+        """A client whose /chart responses never contain the coin."""
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 200
+        resp.headers = {}
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"coins": {}}
+        client = MagicMock(spec=httpx.Client)
+        client.get.return_value = resp
+        return client
+
+    @staticmethod
+    def _historical_client(price: float = 2014.54) -> MagicMock:
+        """Empty on /chart, priced on /prices/historical — the MKR shape."""
+        client = MagicMock(spec=httpx.Client)
+
+        def _get(url, **kwargs):
+            resp = MagicMock(spec=httpx.Response)
+            resp.status_code = 200
+            resp.headers = {}
+            resp.raise_for_status.return_value = None
+            if "/prices/historical/" in url:
+                ts = int(url.split("/historical/")[1].split("/")[0])
+                resp.json.return_value = {
+                    "coins": {
+                        CID: {
+                            "price": price,
+                            "timestamp": ts,
+                            "symbol": "UNI",
+                            "decimals": 18,
+                            "confidence": 0.99,
+                        }
+                    }
+                }
+            else:
+                resp.json.return_value = {"coins": {}}
+            return resp
+
+        client.get.side_effect = _get
+        return client
+
+    def test_covered_token_caches_chart_and_uses_it(self, tmp_path):
+        db = tmp_path / "p.duckdb"
+        result = fetch_and_persist_prices(
+            chain="ethereum",
+            token_address=UNI,
+            span_days=1,
+            db_path=db,
+            client=_client(_points(("2026-09-30T05:10:00+00:00", 8.80))),
+        )
+        assert result.route == "chart"
+        assert result.route_probed is True
+        with connect(db) as conn:
+            assert route_cache.get_route(conn, "ethereum", UNI) == "chart"
+
+    def test_cached_verdict_skips_the_probe(self, tmp_path):
+        """The probe costs one request per token ever, not per run."""
+        db = tmp_path / "p.duckdb"
+        with connect(db) as conn:
+            route_cache.create_tables(conn)
+            route_cache.set_route(conn, "ethereum", UNI, "chart")
+
+        client = _client(_points(("2026-09-30T05:10:00+00:00", 8.80)))
+        result = fetch_and_persist_prices(
+            chain="ethereum", token_address=UNI, span_days=1, db_path=db, client=client
+        )
+        assert result.route_probed is False
+        # 1 call: the chunk fetch only, no probe.
+        assert client.get.call_count == 1
+
+    def test_uncovered_token_falls_back_to_historical(self, tmp_path, monkeypatch):
+        """The MKR case end to end: absent from /chart, priced per timestamp."""
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        db = tmp_path / "p.duckdb"
+        result = fetch_and_persist_prices(
+            chain="ethereum",
+            token_address=UNI,
+            span_days=1,
+            db_path=db,
+            client=self._historical_client(),
+        )
+        assert result.route == "historical"
+        assert result.written == 24  # one per hour of the span
+        with connect(db) as conn:
+            assert route_cache.get_route(conn, "ethereum", UNI) == "historical"
+
+    def test_fallback_rows_record_their_route(self, tmp_path, monkeypatch):
+        """Provenance is answerable after the fact."""
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        db = tmp_path / "p.duckdb"
+        fetch_and_persist_prices(
+            chain="ethereum",
+            token_address=UNI,
+            span_days=1,
+            db_path=db,
+            client=self._historical_client(),
+        )
+        with connect(db) as conn:
+            routes = conn.execute("SELECT DISTINCT route FROM token_price").fetchall()
+        assert routes == [("historical",)]
+
+    def test_chart_rows_record_their_route(self, tmp_path):
+        db = tmp_path / "p.duckdb"
+        fetch_and_persist_prices(
+            chain="ethereum",
+            token_address=UNI,
+            span_days=1,
+            db_path=db,
+            client=_client(_points(("2026-09-30T05:10:00+00:00", 8.80))),
+        )
+        with connect(db) as conn:
+            routes = conn.execute("SELECT DISTINCT route FROM token_price").fetchall()
+        assert routes == [("chart",)]
+
+    def test_both_routes_empty_caches_unpriceable(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        db = tmp_path / "p.duckdb"
+        result = fetch_and_persist_prices(
+            chain="ethereum",
+            token_address=UNI,
+            span_days=1,
+            db_path=db,
+            client=self._empty_chart_client(),
+        )
+        assert result.route == "unpriceable"
+        assert result.written == 0
+        with connect(db) as conn:
+            assert route_cache.get_route(conn, "ethereum", UNI) == "unpriceable"
+
+    def test_cached_unpriceable_fetches_nothing(self, tmp_path):
+        """No probe, no fallback walk — the expensive path is not re-paid."""
+        db = tmp_path / "p.duckdb"
+        with connect(db) as conn:
+            route_cache.create_tables(conn)
+            route_cache.set_route(conn, "ethereum", UNI, "unpriceable")
+
+        client = _client(_points(("2026-09-30T05:10:00+00:00", 8.80)))
+        result = fetch_and_persist_prices(
+            chain="ethereum", token_address=UNI, span_days=1, db_path=db, client=client
+        )
+        assert result.route == "unpriceable"
+        assert result.written == 0
+        assert client.get.call_count == 0
+
+    def test_a_cached_historical_verdict_is_not_re_probed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        db = tmp_path / "p.duckdb"
+        with connect(db) as conn:
+            route_cache.create_tables(conn)
+            route_cache.set_route(conn, "ethereum", UNI, "historical")
+
+        client = self._historical_client()
+        result = fetch_and_persist_prices(
+            chain="ethereum", token_address=UNI, span_days=1, db_path=db, client=client
+        )
+        assert result.route_probed is False
+        # 24 historical calls for a 1-day span, and no /chart probe among them.
+        assert client.get.call_count == 24
+        assert all("/prices/historical/" in c.args[0] for c in client.get.call_args_list)

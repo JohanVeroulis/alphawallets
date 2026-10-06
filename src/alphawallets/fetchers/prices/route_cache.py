@@ -32,7 +32,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Literal
 
-from duckdb import DuckDBPyConnection
+from duckdb import CatalogException, DuckDBPyConnection
 
 from alphawallets.config import Chain
 from alphawallets.db import assert_table_matches_ddl
@@ -102,11 +102,21 @@ def get_route(
     Returns:
         'chart', 'historical', 'unpriceable', or None.
     """
-    row = conn.execute(
-        "SELECT preferred_route FROM token_price_route "
-        "WHERE chain = ? AND lower(token_address) = ?",
-        [chain, token_address.lower()],
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT preferred_route FROM token_price_route "
+            "WHERE chain = ? AND lower(token_address) = ?",
+            [chain, token_address.lower()],
+        ).fetchone()
+    except CatalogException:
+        # The table does not exist yet, which happens on a cache where AW_03 has
+        # not run since the route cache was introduced. "No verdict" is the
+        # correct answer and matches the contract below — a pipeline stage should
+        # not fail because a fetcher has not run.
+        logger.debug(
+            "token_price_route does not exist; treating %s:%s as unprobed", chain, token_address
+        )
+        return None
     if row is None:
         return None
 
