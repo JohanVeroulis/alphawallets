@@ -31,3 +31,4 @@ This folder records significant decisions: what we chose, why, and what we gave 
 | [0009](0009-duckdb-connection-and-schema-conventions.md) | DuckDB connection and schema conventions | Accepted |
 | [0010](0010-defillama-historical-fallback.md) | DefiLlama historical price fallback for /chart gaps | Accepted |
 | [0011](0011-chain-aware-backfill-parallelization.md) | Chain-aware backfill parallelization | Accepted |
+| [0012](0012-pnl-methodology.md) | PnL calculation methodology | Accepted |
