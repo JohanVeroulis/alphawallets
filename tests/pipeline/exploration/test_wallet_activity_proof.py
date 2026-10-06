@@ -329,8 +329,8 @@ class TestSummarise:
         assert (before.priced, before.pending) == (3, 1)
 
         cache.execute(
-            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ["ethereum", UNI, FIXTURE_H07, 8.96, 0.99, "defillama", FIXTURE_H07],
+            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", UNI, FIXTURE_H07, 8.96, 0.99, "defillama", "chart", FIXTURE_H07],
         )
 
         _events, after = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
@@ -341,8 +341,8 @@ class TestSummarise:
     def test_filling_the_hole_reaches_full_pricing(self, cache):
         """The other direction: patching hour 05 clears the unavailable bucket."""
         cache.execute(
-            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ["ethereum", UNI, FIXTURE_H05, 8.93, 0.99, "defillama", FIXTURE_H05],
+            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", UNI, FIXTURE_H05, 8.93, 0.99, "defillama", "chart", FIXTURE_H05],
         )
         _events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         assert summary.unavailable == 0
@@ -494,8 +494,8 @@ class TestFormatting:
     def test_no_pending_note_when_nothing_pending(self, cache):
         """Price the hour above the head, and the lag note disappears."""
         cache.execute(
-            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ["ethereum", UNI, FIXTURE_H07, 8.96, 0.99, "defillama", FIXTURE_H07],
+            "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", UNI, FIXTURE_H07, 8.96, 0.99, "defillama", "chart", FIXTURE_H07],
         )
         events, summary = build_wallet_timeline(cache, WALLET, "ethereum", UNI)
         rendered = format_timeline(events, summary, WALLET, "ethereum", UNI)
@@ -705,8 +705,16 @@ class TestUnpriceableState:
             )
 
     def test_timeline_classifies_a_route_less_token(self, cache):
-        """End to end: the orchestrator resolves the flag from the token itself."""
+        """End to end: the orchestrator reads the verdict from the route cache.
+
+        The token is marked unpriceable in the cache rather than being a
+        hardcoded address, so this tests the mechanism rather than one token's
+        current coverage — MKR itself is now served by /prices/historical.
+        """
+        from alphawallets.fetchers.prices import route_cache
+
         mkr = "0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2"
+        route_cache.set_route(cache, "ethereum", mkr, "unpriceable")
         cache.execute(
             "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [

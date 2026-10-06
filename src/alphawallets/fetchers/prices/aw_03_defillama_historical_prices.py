@@ -28,6 +28,7 @@ import math
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 from duckdb import DuckDBPyConnection
@@ -35,7 +36,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from alphawallets.config import Chain
 from alphawallets.db import connect
-from alphawallets.fetchers.prices.defillama_client import chunk_plan, fetch_chart
+from alphawallets.fetchers.prices import route_cache
+from alphawallets.fetchers.prices.defillama_client import (
+    chart_has_coverage,
+    chunk_plan,
+    fetch_chart,
+    fetch_historical_span,
+)
 from alphawallets.fetchers.prices.mapper import to_raw_price_point, to_token_price
 from alphawallets.fetchers.prices.models import TokenPrice
 from alphawallets.fetchers.prices.writer import create_tables, write_token_prices
@@ -81,7 +88,62 @@ class FetchResult(BaseModel):
         ),
     )
     written: int = Field(ge=0)
+    route: str = Field(
+        default="chart",
+        description=(
+            "Which DefiLlama endpoint served this run: 'chart' (bulk), "
+            "'historical' (per-timestamp fallback), or 'unpriceable' (neither)."
+        ),
+    )
+    route_probed: bool = Field(
+        default=False,
+        description="True when this run discovered the route rather than reading the cache",
+    )
     elapsed_seconds: float = Field(ge=0)
+
+
+def resolve_route(
+    conn: DuckDBPyConnection,
+    client: httpx.Client,
+    chain: Chain,
+    token_address: str,
+) -> tuple[route_cache.PriceRoute, bool]:
+    """Decide which endpoint to fetch a token with, probing only when unknown.
+
+    The discovery flow from ADR 0010:
+
+    - A cached verdict is used as-is. No request, no cost.
+    - No verdict means probe /chart once. Covered becomes 'chart'; empty becomes
+      'historical', which the caller then attempts.
+    - 'unpriceable' is only ever written by the caller, after the fallback has
+      also failed. This function never concludes it from a single probe, because
+      /chart being empty says nothing about /prices/historical.
+
+    Args:
+        conn: Open DuckDB connection, with the route table created.
+        client: An httpx.Client for the probe.
+        chain: Chain name.
+        token_address: Token contract.
+
+    Returns:
+        (route, probed) — the route to use, and whether this call discovered it.
+    """
+    cached = route_cache.get_route(conn, chain, token_address)
+    if cached is not None:
+        logger.info("Route for %s:%s from cache: %s", chain, token_address, cached)
+        return cached, False
+
+    covered = chart_has_coverage(client, chain, token_address)
+    route: route_cache.PriceRoute = "chart" if covered else "historical"
+    route_cache.set_route(conn, chain, token_address, route)
+    logger.info(
+        "Probed %s:%s — /chart %s, using %s",
+        chain,
+        token_address,
+        "covers it" if covered else "does not cover it",
+        route,
+    )
+    return route, True
 
 
 def fetch_and_persist_prices(
@@ -126,8 +188,38 @@ def fetch_and_persist_prices(
     owns_client = client is None
     http_client = client if client is not None else httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)
 
+    entries: list[dict[str, Any]] = []
     try:
-        entries = fetch_chart(http_client, chain, token_address, span_days, period)
+        with connect(db_path) as conn:
+            create_tables(conn)
+            route_cache.create_tables(conn)
+            route, probed = resolve_route(conn, http_client, chain, token_address)
+
+        if route == "unpriceable":
+            # Already established that neither endpoint serves this token. Nothing
+            # to fetch and nothing to report as a failure — the pipeline reads the
+            # same verdict and classifies its events accordingly (PR #27).
+            logger.info(
+                "Skipping %s:%s — no configured price route serves it (see ADR 0010)",
+                chain,
+                token_address,
+            )
+        elif route == "chart":
+            entries = fetch_chart(http_client, chain, token_address, span_days, period)
+        else:
+            entries = fetch_historical_span(http_client, chain, token_address, span_days, period)
+            if not entries and probed:
+                # /chart was empty and the fallback produced nothing either, so
+                # the token is genuinely unpriceable. Recorded now so the next
+                # run skips it instead of paying for the fallback walk again.
+                route = "unpriceable"
+                with connect(db_path) as conn:
+                    route_cache.set_route(conn, chain, token_address, "unpriceable")
+                logger.warning(
+                    "Neither route serves %s:%s; cached as unpriceable",
+                    chain,
+                    token_address,
+                )
     finally:
         if owns_client:
             http_client.close()
@@ -142,7 +234,7 @@ def fetch_and_persist_prices(
 
     with connect(db_path) as conn:
         create_tables(conn)
-        written = write_token_prices(conn, prices)
+        written = write_token_prices(conn, prices, route=route)
 
     elapsed = time.time() - start_time
 
@@ -156,17 +248,20 @@ def fetch_and_persist_prices(
         mapped=len(prices),
         duplicate_after_alignment=len(prices) - written,
         written=written,
+        route=route,
+        route_probed=probed,
         elapsed_seconds=round(elapsed, 3),
     )
 
     logger.info(
         "fetch_and_persist_prices: chain=%s token=%s span=%dd period=%s chunks=%d "
-        "seen=%d mapped=%d written=%d duplicate_after_alignment=%d elapsed=%.2fs",
+        "route=%s seen=%d mapped=%d written=%d duplicate_after_alignment=%d elapsed=%.2fs",
         result.chain,
         result.token_address,
         result.span_days,
         result.period,
         result.chunks_fetched,
+        result.route,
         result.raw_points_seen,
         result.mapped,
         result.written,

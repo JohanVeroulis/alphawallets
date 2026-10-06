@@ -183,8 +183,11 @@ def build_wallet_timeline(
     # classification depends on cached data rather than on the wall clock.
     grid_head = query_price_grid_head(conn, chain, token_address)
 
-    # A property of the token, not of any one event, so resolved once.
-    unpriceable = is_unpriceable(chain, token_address)
+    # A property of the token, not of any one event, so resolved once. Read from
+    # the route cache AW_03's discovery probe writes (ADR 0010), so a token
+    # becomes priceable here the moment a route is found for it — no second list
+    # to keep in sync.
+    unpriceable = is_unpriceable(conn, chain, token_address)
     if unpriceable:
         logger.info(
             "No configured price route serves chain=%s token=%s; "

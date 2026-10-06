@@ -53,6 +53,16 @@ MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 1.0
 RETRY_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
+# Cap on an honoured Retry-After. A provider asking us to wait an hour is not
+# something an interactive backfill should obey silently; the request fails
+# instead, and the operator decides.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+# Target pacing for the per-timestamp fallback route, which issues one request
+# per hour of history rather than one per 500 points. ~5 req/sec keeps a
+# 720-point backfill near 2.5 minutes while staying well inside the free tier.
+HISTORICAL_REQUEST_INTERVAL_SECONDS = 0.2
+
 _PERIOD_SECONDS: dict[str, int] = {
     "1h": 3600,
     "4h": 4 * 3600,
@@ -275,6 +285,191 @@ def fetch_chart(
     return collected
 
 
+def fetch_historical_price(
+    client: httpx.Client,
+    chain: str,
+    token_address: str,
+    timestamp_unix: int,
+) -> dict[str, Any] | None:
+    """Fetch one price point from the per-timestamp route.
+
+    The fallback for coins absent from /chart (ADR 0010). One request per
+    (token, hour), so it is roughly three orders of magnitude more requests than
+    the bulk route for the same span — called only where /chart cannot serve.
+
+    Returns an entry in the same flattened shape fetch_chart_chunk produces, so
+    the mapper needs no knowledge of which route a point came from.
+
+    Args:
+        client: An httpx.Client (caller owns its lifetime and timeout).
+        chain: DefiLlama chain name, e.g. 'ethereum'.
+        token_address: Token contract address.
+        timestamp_unix: The instant to price, in Unix seconds.
+
+    Returns:
+        An entry with 'timestamp', 'price', 'symbol', 'decimals' and
+        'confidence', or None when DefiLlama has no price for that coin at that
+        instant. None is a coverage answer, not an error — a 200 response that
+        simply omits the coin.
+
+    Raises:
+        ValueError: If the API rejects the request outright (HTTP 400).
+        httpx.HTTPError: On a transport failure that outlived the retries.
+    """
+    cid = coin_id(chain, token_address)
+    response = _get_with_retry(
+        client, f"{DEFILLAMA_BASE}/prices/historical/{timestamp_unix}/{cid}", {}
+    )
+
+    if response.status_code == 400:
+        raise ValueError(f"DefiLlama rejected the request for {cid}: {_error_message(response)}")
+    if response.status_code == 404:
+        # Treated as absence rather than an error: the route answers "no such
+        # coin" this way for some inputs, which is a coverage fact.
+        logger.debug("No price for %s at %d (HTTP 404)", cid, timestamp_unix)
+        return None
+    response.raise_for_status()
+
+    payload = response.json()
+    entry = (payload.get("coins") or {}).get(cid)
+    if entry is None:
+        logger.debug("No price for %s at %d (coin absent from response)", cid, timestamp_unix)
+        return None
+
+    price = entry.get("price")
+    if price is None:
+        logger.warning("%s returned an entry with no price at %d", cid, timestamp_unix)
+        return None
+
+    # The route reports the timestamp it actually priced, which can differ from
+    # the one requested. The reported value is used, so the mapper aligns the
+    # observation rather than the request — the same truncation semantics /chart
+    # points go through.
+    reported = entry.get("timestamp")
+    if not isinstance(reported, int):
+        logger.warning(
+            "%s returned an unusable timestamp %r at %d; using the requested instant",
+            cid,
+            reported,
+            timestamp_unix,
+        )
+        reported = timestamp_unix
+
+    return {
+        "timestamp": reported,
+        "price": price,
+        "symbol": entry.get("symbol"),
+        "decimals": entry.get("decimals"),
+        "confidence": entry.get("confidence"),
+    }
+
+
+def chart_has_coverage(client: httpx.Client, chain: str, token_address: str) -> bool:
+    """Probe whether /chart serves a coin at all.
+
+    One small request — two points — rather than a full span, so a miss costs
+    almost nothing. Used by the route cache on a miss (ADR 0010): the gap is a
+    property of the provider at a point in time, not of our token set, so it is
+    discovered rather than configured.
+
+    Returns:
+        True when /chart returns at least one point for the coin.
+    """
+    cid = coin_id(chain, token_address)
+    try:
+        points = fetch_chart_chunk(client, chain, token_address, span=2, period="1h")
+    except ValueError as e:
+        # "no data for {cid}" is the absence signal; anything else is a real
+        # problem and should not be silently read as a coverage verdict.
+        if "returned no data" not in str(e):
+            raise
+        logger.info("/chart has no coverage for %s", cid)
+        return False
+    covered = len(points) > 0
+    logger.info("/chart coverage probe for %s: %s", cid, "covered" if covered else "empty")
+    return covered
+
+
+def fetch_historical_span(
+    client: httpx.Client,
+    chain: str,
+    token_address: str,
+    span_days: int,
+    period: str = "1h",
+    request_interval: float = HISTORICAL_REQUEST_INTERVAL_SECONDS,
+) -> list[dict[str, Any]]:
+    """Fetch a full span one timestamp at a time, paced to respect the free tier.
+
+    The fallback equivalent of fetch_chart: same arguments, same return shape, so
+    the orchestrator differs only in which function it calls.
+
+    Args:
+        client: An httpx.Client.
+        chain: DefiLlama chain name.
+        token_address: Token contract address.
+        span_days: How many days of history to cover.
+        period: Sampling interval, e.g. '1h'.
+        request_interval: Seconds to wait between requests. ADR 0007's lesson
+            applied to a second provider: the constraint is concentration, and
+            this route concentrates by construction.
+
+    Returns:
+        Chronologically sorted entries, one per distinct reported timestamp.
+        Hours the provider cannot price are simply absent.
+    """
+    total_points, _n_chunks, _chunk_span = chunk_plan(span_days, period)
+    step = period_seconds(period)
+    start_ts = int((datetime.now(tz=UTC) - timedelta(days=span_days)).timestamp())
+
+    logger.info(
+        "Fetching %s via /prices/historical: %d days at %s = %d requests "
+        "(~%.0fs at %.2fs intervals)",
+        coin_id(chain, token_address),
+        span_days,
+        period,
+        total_points,
+        total_points * request_interval,
+        request_interval,
+    )
+
+    collected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    missing = 0
+
+    for index in range(total_points):
+        if index:
+            time.sleep(request_interval)
+        entry = fetch_historical_price(client, chain, token_address, start_ts + index * step)
+        if entry is None:
+            missing += 1
+            continue
+        if entry["timestamp"] in seen:
+            # Adjacent requests can resolve to one observation when the provider
+            # has a sparser grid than we are asking for.
+            continue
+        seen.add(entry["timestamp"])
+        collected.append(entry)
+
+        if (index + 1) % 100 == 0:
+            logger.info(
+                "  %d/%d requests, %d points, %d unpriced",
+                index + 1,
+                total_points,
+                len(collected),
+                missing,
+            )
+
+    collected.sort(key=lambda p: p["timestamp"])
+    logger.info(
+        "Fetched %d distinct points for %s across %d requests (%d unpriced)",
+        len(collected),
+        coin_id(chain, token_address),
+        total_points,
+        missing,
+    )
+    return collected
+
+
 # ---------- Internals ----------
 
 
@@ -287,6 +482,27 @@ def _error_message(response: httpx.Response) -> str:
     if isinstance(body, dict):
         return str(body.get("message") or body)
     return str(body)[:200]
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a Retry-After header into seconds, or None when absent or unusable.
+
+    Only the delta-seconds form is handled. The HTTP-date form is valid but
+    DefiLlama has not been observed sending it, and a misparsed date would
+    produce a wildly wrong sleep — returning None falls back to the exponential
+    backoff, which is the safe direction to be wrong in.
+    """
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw.strip())
+    except ValueError:
+        logger.warning("Unparseable Retry-After header %r; using exponential backoff", raw)
+        return None
+    if seconds < 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
 def _get_with_retry(
@@ -328,13 +544,16 @@ def _get_with_retry(
             )
             return response
 
-        delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+        # Retry-After, when the provider sends one, is authoritative — guessing a
+        # shorter backoff than the server asked for is how a 429 becomes a ban.
+        delay = _retry_after_seconds(response) or BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
         logger.warning(
-            "HTTP %d on attempt %d/%d; retrying in %.1fs",
+            "HTTP %d on attempt %d/%d; retrying in %.1fs%s",
             response.status_code,
             attempt,
             MAX_ATTEMPTS,
             delay,
+            " (Retry-After)" if _retry_after_seconds(response) else "",
         )
         time.sleep(delay)
 

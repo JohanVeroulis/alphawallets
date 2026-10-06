@@ -32,8 +32,8 @@ def conn():
 
 def _add_price(conn, ts, token=UNI, chain="ethereum", source="defillama") -> None:
     conn.execute(
-        "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [chain, token, ts, 8.94, 0.99, source, NOW],
+        "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [chain, token, ts, 8.94, 0.99, source, "chart", NOW],
     )
 
 

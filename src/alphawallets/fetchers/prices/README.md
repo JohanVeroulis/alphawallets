@@ -95,13 +95,33 @@ uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices 
 
 `--token 0x...` still works and is mutually exclusive with `--token-symbol`; passing neither keeps the UNI default. The flag is named `--token-symbol` rather than `--token` because `--token` already means the contract address here.
 
-**Known coverage gap: MKR has no `/chart` timeseries.** DefiLlama serves it from `/prices/current` and `/prices/historical` but returns no coin at all on `/chart`, at any span, so this fetcher fails on it:
+### Route selection
 
-```
-DefiLlama returned no data for ethereum:0x9f8f72aa9304c8b593d555f12ef6589cc3a579a2
-```
+AW_03 picks its endpoint per token. `token_price_route` remembers the verdict, so the coverage probe costs one request per token *ever* rather than one per run.
 
-The address is correct and the token is priced — the bulk endpoint simply does not carry it. Measured across all 18 verified `(token, chain)` pairs on 2026-10-03: **17/18 OK, 2,732 rows written in 7s**, MKR the only failure. This is why [ADR 0008](../../../../docs/decisions/0008-defillama-historical-prices.md)'s "100% coverage" result is scoped to `/prices/historical`: coverage is endpoint-specific, and the route this fetcher uses was never what that measurement tested. A `/prices/historical` fallback is proposed as ADR 0010 with MKR as the first case.
+| Verdict | Meaning | Cost for 30 days hourly |
+|---|---|---|
+| `chart` | The bulk route serves it | 2 requests |
+| `historical` | Absent from `/chart`, served per timestamp | ~720 requests |
+| `unpriceable` | Neither route returns a price | 0 — skipped |
+
+**Probe on miss.** With no cached verdict, AW_03 probes `/chart` with a 2-point request. Covered becomes `chart`; empty becomes `historical`, which is then attempted. Only if the fallback *also* returns nothing is `unpriceable` recorded — `/chart` being empty says nothing about `/prices/historical`, so a single probe never concludes it.
+
+Discovery lives in the fetcher rather than a config file because the gap is a property of the provider at a point in time, not of our token set: the next token to migrate the way MKR did gets classified by code, not by someone remembering to edit a list.
+
+A verdict is a snapshot. `last_verified` records when it was established and `route_cache.clear_route()` forces a re-probe — a token that gains `/chart` coverage keeps using the slow path until something clears it, and nothing notices that on its own.
+
+Measured on 2026-10-06 across all 18 verified `(token, chain)` pairs: **17 `chart`, 1 `historical`** (MKR on Ethereum), 2,893 rows in 63s. The fallback ran at **3.12 req/sec** with no 429s.
+
+Each `token_price` row carries the `route` that produced it, so the provenance of a price is answerable after the fact. `route` is deliberately **not** in the primary key — a token has one authoritative price per hour, not one per route.
+
+### Known limitation: provider grid granularity
+
+MKR is now priced, but DefiLlama's `/prices/historical` data for it sits on a **4-hour grid**, not hourly: 168 hourly requests returned 43 points, with every gap exactly 4 hours and the stored hours exactly `{0, 4, 8, 12, 16, 20}`.
+
+The pipeline joins on the hour, so MKR events in the other three hours of each block find no price row and classify as `unavailable` — which prints a warning telling the operator to re-run AW_03. **That remedy is false:** the provider has no hourly MKR data, so re-running cannot help.
+
+This is the same error shape [ADR 0010](../../../../docs/decisions/0010-defillama-historical-fallback.md) exists to prevent, one level down. Wall-clock `pending` once told operators to re-run when the data did not exist upstream; now `unavailable` tells them to re-run when the data does not exist *at that resolution*. Proposed for its own record as ADR 0013 — likely a bounded nearest-prior-price lookup for PnL, plus a distinct off-grid state so the `unavailable` warning stays worth acting on.
 
 ### Verifying coverage
 
