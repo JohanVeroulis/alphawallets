@@ -22,11 +22,22 @@ CID = f"ethereum:{UNI}"
 # ---------- Helpers ----------
 
 
-def _response(status: int = 200, json_body: Any = None, text: str = "") -> MagicMock:
-    """A stand-in for httpx.Response with just what the client touches."""
+def _response(
+    status: int = 200,
+    json_body: Any = None,
+    text: str = "",
+    headers: dict[str, str] | None = None,
+) -> MagicMock:
+    """A stand-in for httpx.Response with just what the client touches.
+
+    headers is a real dict rather than a MagicMock attribute: the retry path
+    reads Retry-After from it, and a Mock would return a Mock for .get() and
+    then fail to parse as a float in a way that looks like a client bug.
+    """
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = status
     resp.text = text
+    resp.headers = headers if headers is not None else {}
     if json_body is None:
         resp.json.side_effect = ValueError("no json")
     else:
