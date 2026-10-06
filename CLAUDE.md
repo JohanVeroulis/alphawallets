@@ -231,7 +231,9 @@ Items marked *provisional* are working assumptions, to be validated in Weeks 1�
 
 **Price coverage classification is four-state.** `priced` / `pending` / `unavailable` / `unpriceable`, with only `unavailable` representing a real gap. The fourth state closes the Week 3 awareness item raised in PR #25: a token no route can serve never acquires a grid head, so without it every such event read as indefinitely `pending`. Source is `src/alphawallets/unpriceable.py` until ADR 0010's route cache lands. See `pipeline/exploration/README.md` for the table.
 
-**DefiLlama price coverage is endpoint-specific.** The `/chart` route AW_03 uses covers 17 of the 18 verified (token, chain) pairs; MKR is served only by the per-timestamp endpoints. The fallback design — a cached route probe writing into the same `token_price` table — is recorded in [ADR 0010](docs/decisions/0010-defillama-historical-fallback.md), with implementation tracked as a follow-up PR. Until it lands, MKR has no stored prices and a permanently-uncovered token reads as indefinitely `pending` under ADR 0009's classification.
+**DefiLlama price coverage is endpoint-specific, and the fallback is implemented.** The `/chart` route covers 17 of the 18 verified (token, chain) pairs; MKR is served only per-timestamp. [ADR 0010](docs/decisions/0010-defillama-historical-fallback.md) is now built: AW_03 probes `/chart` once per token, caches the verdict in `token_price_route`, and falls back to `/prices/historical` where needed. MKR is priced. `unpriceable` is no longer a hand-maintained list — `is_unpriceable()` reads the route cache, so a token becomes priceable the moment a route is found for it.
+
+**Open: provider grid granularity.** MKR's historical data is on a 4-hour grid, so events in the other three hours of each block classify as `unavailable` and print a "re-run AW_03" remedy that cannot help. Same error shape ADR 0010 prevents, one level down. Proposed as ADR 0013 — likely a bounded nearest-prior lookup plus a distinct off-grid state.
 
 ### Decided
 - [x] **Data source:** Alchemy free tier — see [ADR 0003](docs/decisions/0003-alchemy-over-dune.md)
