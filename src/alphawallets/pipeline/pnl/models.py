@@ -5,9 +5,9 @@ Three domain objects, all frozen:
 - CostBasisLot — one acquisition sitting in a wallet's FIFO stack. Carries
   the quantity still available for consumption, the per-token USD cost basis
   at the time of acquisition, and the source (trading or airdrop). FIFO
-  consumption removes from the oldest trading lot first; airdrop lots are
-  consumed in a parallel sub-stack so proceeds from selling airdropped
-  tokens realize as airdrop PnL rather than trading PnL (ADR 0012 decision 4).
+  consumption removes from the oldest lot first, oldest-first across both
+  sub-stacks regardless of source. The source tag on each Realization carries
+  the trading/airdrop attribution for the PnL split (ADR 0012 decision 4).
 
 - Realization — one consumption event (a sell swap, or an outflow that the
   engine chose to realize). Records the matched lot's cost basis against the
@@ -57,10 +57,10 @@ LotSource = Literal["trading", "airdrop"]
 class CostBasisLot(BaseModel):
     """One acquisition in a wallet's FIFO stack for a single token.
 
-    Lots are consumed oldest-first within their source bucket. The engine keeps
-    one list of trading lots and one list of airdrop lots per (wallet, token);
-    which bucket a consumption draws from is a policy decision the engine makes
-    before it reaches a lot — see cost_basis.py (follow-up PR).
+    The source literal tags the lot's origin and is carried onto any Realization
+    it produces, so trading and airdrop PnL can be summed per window by
+    filtering Realization.source. Consumption order is unified FIFO
+    (oldest-first) across sources — see cost_basis.py.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -82,7 +82,9 @@ class CostBasisLot(BaseModel):
             "this is the price-at-receipt. For an airdrop lot, this is 0.0."
         ),
     )
-    source: LotSource = Field(description="Trading or airdrop; selects the FIFO sub-stack")
+    source: LotSource = Field(
+        description="Trading or airdrop; carried onto each Realization for the PnL split"
+    )
 
     @field_validator("acquired_at")
     @classmethod
