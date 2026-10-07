@@ -1787,19 +1787,33 @@ class TestEmissionFlags:
 
 
 class TestAsOf:
-    def test_defaults_to_the_newest_indexed_block(self, replay_db):
+    def test_defaults_to_just_past_the_newest_indexed_block(self, replay_db):
+        """One microsecond past the newest event, not the event's own instant.
+
+        window_end is exclusive, so defaulting to MAX(block_timestamp) exactly
+        would exclude every event in the newest block — and in a cache whose
+        events share one timestamp, exclude all of them and report no activity.
+        """
         _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
         _insert(replay_db, unique_id="late", block_timestamp=H2, block_number=2, log_index=0)
         rows = list(compute_wallet_pnl(replay_db))
         assert rows
-        assert {r.window_end for r in rows} == {H2}
+        assert {r.window_end for r in rows} == {H2 + timedelta(microseconds=1)}
+
+    def test_default_includes_the_newest_event(self, replay_db):
+        """The regression this guards: a single-event cache must not be empty."""
+        _insert(replay_db, unique_id="only", block_timestamp=H0, block_number=1, log_index=0)
+        rows = [r for r in compute_wallet_pnl(replay_db) if r.wallet == WALLET]
+        assert rows
+        assert all(r.bought_usd == pytest.approx(10.0) for r in rows)
 
     def test_default_is_the_data_edge_not_wall_clock(self, replay_db):
         """Using now() would open a gap between the last indexed block and the
         window end, and make the result depend on when it was run."""
         _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
         rows = list(compute_wallet_pnl(replay_db))
-        assert all(r.window_end == H0 for r in rows)
+        assert rows
+        assert all(r.window_end == H0 + timedelta(microseconds=1) for r in rows)
 
     def test_explicit_as_of_excludes_later_events(self, replay_db):
         """Not applied-then-filtered: a future event must not enter the stack,
