@@ -21,7 +21,9 @@ from alphawallets.pipeline.pnl.calculator import (
     _load_price_cache,
     _lookup_price,
     _process_events,
+    compute_wallet_pnl,
 )
+from alphawallets.pipeline.pnl.models import WalletPnL
 
 WALLET = "0x" + "1" * 40
 OTHER = "0x" + "2" * 40
@@ -1531,3 +1533,409 @@ class TestPoolDestinationRealization:
         pool_state = partitions[_key(UNI_WETH_POOL)]
         assert pool_state.realizations == []
         assert pool_state.engine.balance_token() == Decimal(WEI)
+
+
+class TestWalletPnLEmission:
+    """Step D: per-partition engine state sliced into per-window rows."""
+
+    def test_empty_cache_yields_nothing(self, replay_db):
+        assert list(compute_wallet_pnl(replay_db)) == []
+
+    def test_trading_in_only_gives_two_open_rows(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2) if r.wallet == WALLET]
+
+        assert len(rows) == 2
+        assert {r.window_end - r.window_start for r in rows} == {
+            timedelta(days=30),
+            timedelta(days=90),
+        }
+        for row in rows:
+            assert row.realized_pnl_usd == 0.0
+            assert row.realization_count == 0
+            assert row.bought_usd == pytest.approx(10.0)
+            assert row.balance_token == Decimal(WEI)
+            assert row.avg_cost_basis_usd == pytest.approx(10.0)
+            assert row.unrealized_pnl_usd is None
+
+    def test_full_sale_closes_the_position(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2) if r.wallet == WALLET]
+
+        assert len(rows) == 2
+        for row in rows:
+            assert row.realized_pnl_usd == pytest.approx(2.0)
+            assert row.realized_pnl_trading_usd == pytest.approx(2.0)
+            assert row.realized_pnl_airdrop_usd == 0.0
+            assert row.realization_count == 1
+            assert row.sold_usd == pytest.approx(12.0)
+            assert row.balance_token == Decimal(0)
+            # None, not 0.0 — an empty stack has no cost basis to average.
+            assert row.avg_cost_basis_usd is None
+
+
+class TestWindowSlicing:
+    """ADR 0012 decision 9: one engine state, windows differ by what they count."""
+
+    @pytest.fixture
+    def spanning_db(self):
+        """Buy at day -60 @ $10, sell at day -20 @ $12, as_of = day 0."""
+        as_of = datetime(2026, 12, 1, 0, 0, tzinfo=UTC)
+        buy_at = as_of - timedelta(days=60)
+        sell_at = as_of - timedelta(days=20)
+        with connect(":memory:") as c:
+            create_erc20_tables(c)
+            create_price_tables(c)
+            _insert_price(c, ts=buy_at, price_usd=10.0, token_address=UNI)
+            _insert_price(c, ts=sell_at, price_usd=12.0, token_address=UNI)
+            _insert(c, unique_id="buy", block_timestamp=buy_at, block_number=1, log_index=0)
+            _insert(
+                c,
+                unique_id="sell",
+                block_timestamp=sell_at,
+                block_number=2,
+                log_index=0,
+                from_addr=WALLET,
+                to_addr=UNI_WETH_POOL,
+            )
+            yield c, as_of
+
+    @staticmethod
+    def _by_window(rows):
+        return {(r.window_end - r.window_start).days: r for r in rows}
+
+    def test_both_windows_see_the_realization(self, spanning_db):
+        conn, as_of = spanning_db
+        rows = self._by_window(
+            r for r in compute_wallet_pnl(conn, as_of=as_of) if r.wallet == WALLET
+        )
+        assert rows[30].realized_pnl_trading_usd == pytest.approx(2.0)
+        assert rows[90].realized_pnl_trading_usd == pytest.approx(2.0)
+
+    def test_bought_usd_differs_by_window(self, spanning_db):
+        """The day-60 acquisition is outside 30d and inside 90d."""
+        conn, as_of = spanning_db
+        rows = self._by_window(
+            r for r in compute_wallet_pnl(conn, as_of=as_of) if r.wallet == WALLET
+        )
+        assert rows[30].bought_usd == 0.0
+        assert rows[90].bought_usd == pytest.approx(10.0)
+
+    def test_cost_basis_is_not_reset_at_the_window_boundary(self, spanning_db):
+        """The 30d row's PnL uses the real $10 cost despite the lot predating it.
+
+        A window-isolated basis would see zero cost and book the whole $12 sale
+        as profit — the concrete failure ADR 0012 rejects window isolation over.
+        """
+        conn, as_of = spanning_db
+        rows = self._by_window(
+            r for r in compute_wallet_pnl(conn, as_of=as_of) if r.wallet == WALLET
+        )
+        assert rows[30].realized_pnl_usd == pytest.approx(2.0)
+        assert rows[30].realized_pnl_usd != pytest.approx(12.0)
+        assert rows[30].sold_usd == pytest.approx(12.0)
+
+    def test_pre_window_flag_differs_by_window(self, spanning_db):
+        """Day -60 is before the 30d window and inside the 90d one."""
+        conn, as_of = spanning_db
+        rows = self._by_window(
+            r for r in compute_wallet_pnl(conn, as_of=as_of) if r.wallet == WALLET
+        )
+        assert rows[30].has_pre_window_activity is True
+        assert rows[90].has_pre_window_activity is False
+
+    def test_window_bounds_are_set_correctly(self, spanning_db):
+        conn, as_of = spanning_db
+        rows = self._by_window(
+            r for r in compute_wallet_pnl(conn, as_of=as_of) if r.wallet == WALLET
+        )
+        for days, row in rows.items():
+            assert row.window_end == as_of
+            assert row.window_start == as_of - timedelta(days=days)
+
+    def test_window_with_no_activity_is_omitted(self):
+        """A row of zeroes and "nothing happened here" are the same fact."""
+        as_of = datetime(2026, 12, 1, tzinfo=UTC)
+        old = as_of - timedelta(days=200)
+        with connect(":memory:") as c:
+            create_erc20_tables(c)
+            create_price_tables(c)
+            _insert_price(c, ts=old, price_usd=10.0, token_address=UNI)
+            _insert(c, unique_id="buy", block_timestamp=old, block_number=1, log_index=0)
+            rows = [r for r in compute_wallet_pnl(c, as_of=as_of) if r.wallet == WALLET]
+        # Outside both windows, so no rows at all.
+        assert rows == []
+
+
+class TestEmissionFlags:
+    def test_unpriceable_flag_set_per_window(self, replay_db):
+        _insert(
+            replay_db,
+            unique_id="unpriced",
+            block_timestamp=H0 + timedelta(hours=9),
+            block_number=1,
+            log_index=0,
+        )
+        rows = [
+            r
+            for r in compute_wallet_pnl(replay_db, as_of=H0 + timedelta(hours=10))
+            if r.wallet == WALLET
+        ]
+        assert rows
+        assert all(r.has_unpriceable_events is True for r in rows)
+
+    def test_unpriceable_flag_false_when_all_priced(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2) if r.wallet == WALLET]
+        assert all(r.has_unpriceable_events is False for r in rows)
+
+    def test_insufficient_balance_implies_pre_window_activity(self, replay_db):
+        """Sending tokens the stack never received can only mean the wallet
+        acquired them before our data starts — evidence of pre-window activity
+        even when every visible event falls inside the window.
+
+        Paired with an in-window acquisition so a row is emitted at all; see
+        test_sell_only_wallet_emits_no_row for why that pairing is needed.
+        """
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        _insert(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2) if r.wallet == WALLET]
+        assert rows
+        assert all(r.has_pre_window_activity is True for r in rows)
+
+    def test_sell_only_wallet_emits_no_row(self, replay_db):
+        """A wallet whose entire visible history is selling a pre-window position
+        produces NO row, so neither its PnL nor its caveat flag is visible.
+
+        The emission rule is "any Realization OR any acquisition in-window", and
+        a sale against an empty stack raises before producing either — so the
+        partition exists and carries has_insufficient_balance, but nothing is
+        emitted to carry it outward. Decision 5 excludes such wallets from the
+        leaderboard anyway, so the ranking is unaffected; what is lost is the
+        flag itself, which step 6's flag-distribution report would need.
+        Documented here rather than worked around.
+        """
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2) if r.wallet == WALLET]
+        assert rows == []
+
+    def test_smart_wallet_signal_is_always_false_in_v1(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        rows = list(compute_wallet_pnl(replay_db, as_of=H2))
+        assert rows
+        assert all(r.has_smart_wallet_signal is False for r in rows)
+
+    def test_airdrop_pnl_lands_in_its_own_column(self, replay_db, confirmed_uni_distributor):
+        _insert(
+            replay_db,
+            unique_id="drop",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=confirmed_uni_distributor,
+            to_addr=WALLET,
+        )
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2) if r.wallet == WALLET]
+        for row in rows:
+            assert row.realized_pnl_airdrop_usd == pytest.approx(12.0)
+            assert row.realized_pnl_trading_usd == 0.0
+            assert row.realized_pnl_usd == pytest.approx(12.0)
+            # Free tokens, so nothing was bought.
+            assert row.bought_usd == 0.0
+
+
+class TestAsOf:
+    def test_defaults_to_the_newest_indexed_block(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(replay_db, unique_id="late", block_timestamp=H2, block_number=2, log_index=0)
+        rows = list(compute_wallet_pnl(replay_db))
+        assert rows
+        assert {r.window_end for r in rows} == {H2}
+
+    def test_default_is_the_data_edge_not_wall_clock(self, replay_db):
+        """Using now() would open a gap between the last indexed block and the
+        window end, and make the result depend on when it was run."""
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        rows = list(compute_wallet_pnl(replay_db))
+        assert all(r.window_end == H0 for r in rows)
+
+    def test_explicit_as_of_excludes_later_events(self, replay_db):
+        """Not applied-then-filtered: a future event must not enter the stack,
+        or it would change which lots an in-window sale consumes."""
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(replay_db, unique_id="later", block_timestamp=H2, block_number=2, log_index=0)
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H1) if r.wallet == WALLET]
+        assert rows
+        for row in rows:
+            # Only the H0 lot — the H2 one was never replayed.
+            assert row.balance_token == Decimal(WEI)
+            assert row.bought_usd == pytest.approx(10.0)
+
+    def test_as_of_boundary_is_exclusive(self, replay_db):
+        _insert(replay_db, unique_id="at_edge", block_timestamp=H1, block_number=1, log_index=0)
+        assert list(compute_wallet_pnl(replay_db, as_of=H1)) == []
+
+    def test_empty_cache_resolves_no_as_of(self, replay_db):
+        assert list(compute_wallet_pnl(replay_db)) == []
+
+
+class TestEmissionScope:
+    def test_two_wallets_give_four_rows(self, replay_db):
+        """Two independent wallets, two windows each, no cross-contamination."""
+        _insert(
+            replay_db,
+            unique_id="a",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert(
+            replay_db,
+            unique_id="b",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=THIRD,
+        )
+        rows = [
+            r
+            for r in compute_wallet_pnl(replay_db, as_of=H2, wallet_filter=[WALLET, THIRD])
+            if True
+        ]
+        assert len(rows) == 4
+        assert {r.wallet for r in rows} == {WALLET, THIRD}
+        for row in rows:
+            assert row.balance_token == Decimal(WEI)
+
+    def test_separate_tokens_get_separate_rows(self, replay_db):
+        _insert_price(replay_db, ts=H0, price_usd=180.0, token_address=AAVE)
+        _insert(replay_db, unique_id="uni", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="aave",
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            token_address=AAVE,
+        )
+        rows = [r for r in compute_wallet_pnl(replay_db, as_of=H2, wallet_filter=[WALLET])]
+        assert len(rows) == 4  # 2 tokens x 2 windows
+        assert {r.token_address for r in rows} == {UNI, AAVE}
+
+    def test_wallet_filter_restricts_emission(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        rows = list(compute_wallet_pnl(replay_db, as_of=H2, wallet_filter=[WALLET]))
+        assert {r.wallet for r in rows} == {WALLET}
+
+    def test_chain_filter_restricts_emission(self, replay_db):
+        _insert_price(replay_db, ts=H0, price_usd=9.0, token_address=UNI, chain="base")
+        _insert(replay_db, unique_id="eth", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="base",
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            chain="base",
+        )
+        rows = list(compute_wallet_pnl(replay_db, as_of=H2, chains=["base"]))
+        assert {r.chain for r in rows} == {"base"}
+
+    def test_returns_a_generator(self, replay_db):
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        result = compute_wallet_pnl(replay_db, as_of=H2)
+        assert not isinstance(result, list)
+        assert isinstance(next(iter(result)), WalletPnL)
+
+
+class TestReproducibility:
+    def test_two_runs_are_identical_modulo_computed_at(self, replay_db):
+        """Same cache, same rows. ADR 0012 consequence 6 says a figure may change
+        when earlier events are re-fetched — not when nothing changed at all.
+        """
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+
+        def snapshot():
+            return [
+                r.model_dump(exclude={"computed_at"})
+                for r in compute_wallet_pnl(replay_db, as_of=H2)
+            ]
+
+        assert snapshot() == snapshot()
+
+    def test_row_order_is_deterministic(self, replay_db):
+        _insert(
+            replay_db,
+            unique_id="a",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert(
+            replay_db,
+            unique_id="b",
+            block_timestamp=H0,
+            block_number=2,
+            log_index=1,
+            from_addr=OTHER,
+            to_addr=THIRD,
+        )
+        first = [(r.wallet, r.window_start) for r in compute_wallet_pnl(replay_db, as_of=H2)]
+        second = [(r.wallet, r.window_start) for r in compute_wallet_pnl(replay_db, as_of=H2)]
+        assert first == second
