@@ -689,10 +689,11 @@ class TestLookupPrice:
 
 @pytest.fixture
 def replay_db():
-    """A cache with both tables created and UNI priced for three hours."""
+    """A cache with every event table created and UNI priced for three hours."""
     with connect(":memory:") as c:
         create_erc20_tables(c)
         create_price_tables(c)
+        create_swap_tables(c)
         _insert_price(c, ts=H0, price_usd=10.0, token_address=UNI)
         _insert_price(c, ts=H1, price_usd=12.0, token_address=UNI)
         _insert_price(c, ts=H2, price_usd=15.0, token_address=UNI)
@@ -2415,3 +2416,534 @@ class TestTransferDedupFilter:
         result = _filter_transfers_by_dedup([], set())
         assert not isinstance(result, list)
         assert list(result) == []
+
+
+class TestSwapEventProcessing:
+    """ADR 0015: swaps priced at what they executed at, not at the hour's price."""
+
+    def test_swap_consumes_the_sold_side_and_opens_the_bought_side(self, replay_db):
+        """One swap: 500 UNI into the pool, 1.5 WETH out."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        partitions = _process_events(replay_db)
+
+        sold = partitions[_key(WALLET, UNI)]
+        bought = partitions[_key(WALLET, WETH)]
+        assert sold.engine.balance_token() == Decimal(0)
+        assert bought.engine.balance_token() == Decimal(15 * 10**17)
+        assert len(sold.realizations) == 1
+        assert bought.realizations == []
+
+    def test_realization_uses_the_executed_price_not_the_grid(self, replay_db):
+        """500 UNI -> 1.5 WETH at WETH $2000 is an executed UNI price of $6.00.
+
+        The hourly UNI price at H1 is $12, so a grid-priced realization would
+        report a very different number. (1.5 * 2000) / 500 = 6.0.
+        """
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        realization = _process_events(replay_db)[_key(WALLET, UNI)].realizations[0]
+
+        assert realization.unit_sale_usd == pytest.approx(6.0)
+        assert realization.unit_cost_usd == pytest.approx(10.0)  # grid price at H0
+        # (6 - 10) * 500 = -2000
+        assert realization.pnl_usd == pytest.approx(-2000.0)
+
+    def test_intra_hour_trade_is_no_longer_zero(self, replay_db):
+        """The whole point of ADR 0015, as a before/after.
+
+        Buy 100 UNI at H0 ($10 grid), then swap 100 UNI -> 0.505 WETH in the
+        SAME hour with WETH at $2000. Executed UNI price = (0.505 * 2000) / 100
+        = $10.10, so PnL = $0.10 * 100 = $10.
+
+        Under the grid path both legs would price at H0's $10 UNI and the
+        realization would be exactly $0 — the 65.4% case PR #42 measured.
+        """
+        _insert_price(replay_db, ts=H0, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=100 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0 + timedelta(minutes=30),
+            block_number=2,
+            log_index=0,
+            amount0=100 * WEI,
+            amount1=-505 * 10**15,
+        )
+        realization = _process_events(replay_db)[_key(WALLET, UNI)].realizations[0]
+
+        assert realization.unit_sale_usd == pytest.approx(10.10)
+        assert realization.pnl_usd == pytest.approx(10.0)
+        assert realization.pnl_usd != 0.0
+
+    def test_bought_side_cost_basis_is_the_hourly_price(self, replay_db):
+        """Which equals the executed-ratio value by construction, so both sides
+        of the trade agree on what it was worth."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        bought = _process_events(replay_db)[_key(WALLET, WETH)]
+        assert bought.engine.avg_cost_basis_usd() == pytest.approx(2000.0)
+        assert bought.engine.balance_token_by_source()["trading"] == Decimal(15 * 10**17)
+
+    def test_buying_the_tracked_token_opens_a_lot(self, replay_db):
+        """The other direction: WETH into the pool, UNI out."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="fund",
+            block_timestamp=H0,
+            block_number=1,
+            qty=2 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+            token_address=WETH,
+        )
+        _insert_price(replay_db, ts=H0, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=-500 * WEI,
+            amount1=15 * 10**17,
+        )
+        partitions = _process_events(replay_db)
+
+        assert partitions[_key(WALLET, UNI)].engine.balance_token() == Decimal(500 * WEI)
+        # (1.5 WETH * $2000) / 500 UNI = $6.00 per UNI paid.
+        assert partitions[_key(WALLET, UNI)].engine.avg_cost_basis_usd() == pytest.approx(6.0)
+
+    def test_cross_source_consumption_through_a_swap(self, replay_db, confirmed_uni_distributor):
+        """Buy 50 UNI, airdrop 50 UNI, then swap 80 UNI out.
+
+        Unified FIFO takes the trading lot first, so the split is 50 trading +
+        30 airdrop — the same behaviour ADR 0014 produced via a pool transfer,
+        now through the swap path, carried by each lot's source.
+        """
+        _insert_price(replay_db, ts=H2, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=50 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="drop",
+            block_timestamp=H1,
+            block_number=2,
+            qty=50 * WEI,
+            from_addr=confirmed_uni_distributor,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H2,
+            block_number=3,
+            log_index=0,
+            amount0=80 * WEI,
+            amount1=-4 * 10**17,
+        )
+        state = _process_events(replay_db)[_key(WALLET, UNI)]
+
+        assert len(state.realizations) == 2
+        first, second = state.realizations
+        assert (first.source, first.qty_token) == ("trading", Decimal(50 * WEI))
+        assert (second.source, second.qty_token) == ("airdrop", Decimal(30 * WEI))
+        assert state.engine.balance_token_by_source() == {
+            "trading": Decimal(0),
+            "airdrop": Decimal(20 * WEI),
+        }
+
+    def test_insufficient_balance_on_a_swap_is_caught(self, replay_db, caplog):
+        """A wallet selling a position acquired before the indexed window."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=1,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        with caplog.at_level(logging.WARNING):
+            partitions = _process_events(replay_db)
+
+        sold = partitions[_key(WALLET, UNI)]
+        assert sold.has_insufficient_balance is True
+        assert sold.realizations == []
+        assert "Insufficient balance on swap" in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_replay_continues_after_an_insufficient_swap(self, replay_db):
+        _insert_price(replay_db, ts=H0, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H1,
+            block_number=2,
+            qty=WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        sold = _process_events(replay_db)[_key(WALLET, UNI)]
+        assert sold.has_insufficient_balance is True
+        assert sold.engine.balance_token() == Decimal(WEI)
+
+    def test_bought_side_opens_a_lot_even_when_the_sale_is_insufficient(self, replay_db):
+        """The two sides are separate partitions; one failing must not lose the
+        other. The wallet really did receive the WETH."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=1,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        partitions = _process_events(replay_db)
+        assert partitions[_key(WALLET, WETH)].engine.balance_token() == Decimal(15 * 10**17)
+
+
+class TestSwapWithNoPriceAnchor:
+    """No hourly price on either side: the executed ratio cannot be anchored."""
+
+    def _setup(self, replay_db):
+        """A swap at an hour where WETH has no price row."""
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        return _process_events(replay_db)
+
+    def test_no_realization_is_booked(self, replay_db):
+        assert self._setup(replay_db)[_key(WALLET, UNI)].realizations == []
+
+    def test_both_partitions_are_flagged(self, replay_db):
+        partitions = self._setup(replay_db)
+        assert partitions[_key(WALLET, UNI)].has_unpriceable_events is True
+        assert partitions[_key(WALLET, WETH)].has_unpriceable_events is True
+
+    def test_the_sold_side_is_still_consumed(self, replay_db):
+        """Deliberately diverging from "skip the swap entirely".
+
+        Dedup has already removed both transfer legs, so nothing else will
+        reduce the stack — skipping would leave the wallet holding tokens it
+        sold, overstating the balance and letting a later realization consume
+        lots that were already gone. Same resolution as PR #40's unpriced
+        pool-destination OUT.
+        """
+        assert self._setup(replay_db)[_key(WALLET, UNI)].engine.balance_token() == Decimal(0)
+
+    def test_the_bought_side_opens_no_lot(self, replay_db):
+        """ADR 0012 decision 6: record the event, flag it, never invent a cost."""
+        bought = self._setup(replay_db)[_key(WALLET, WETH)]
+        assert bought.engine.balance_token() == Decimal(0)
+        assert len(bought.in_events) == 1
+        assert bought.in_events[0].unit_cost_usd is None
+
+    def test_warning_names_the_consequence(self, replay_db, caplog):
+        with caplog.at_level(logging.WARNING):
+            self._setup(replay_db)
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "no hourly price on either side" in combined
+        assert "PnL is understated" in combined
+
+
+class TestSwapAmountSigns:
+    def test_same_sign_amounts_are_skipped(self, replay_db, caplog):
+        """Exactly one amount is positive in a well-formed swap. If not, there is
+        no way to tell which side was sold, and guessing inverts the trade."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=1,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=15 * 10**17,
+        )
+        with caplog.at_level(logging.WARNING):
+            partitions = _process_events(replay_db)
+        assert partitions == {}
+        assert "not one positive and one negative" in "\n".join(
+            r.getMessage() for r in caplog.records
+        )
+
+    def test_zero_amount_is_skipped(self, replay_db, caplog):
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=1,
+            log_index=0,
+            amount0=0,
+            amount1=-15 * 10**17,
+        )
+        with caplog.at_level(logging.WARNING):
+            assert _process_events(replay_db) == {}
+
+
+class TestSwapStreamMerge:
+    def test_events_interleave_chronologically(self, replay_db):
+        """A swap between two transfers must be applied in time order, because
+        the FIFO engine does not sort (PR #33)."""
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="later",
+            block_timestamp=H2,
+            block_number=3,
+            qty=WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET, UNI)]
+        # The swap consumed the H0 lot; only the H2 receipt remains.
+        assert state.engine.balance_token() == Decimal(WEI)
+        assert len(state.realizations) == 1
+
+    def test_swap_sorts_before_an_unindexed_transfer_in_the_same_block(self, replay_db):
+        """Transfers carry no log_index (ADR 0007), so NULLS LAST puts the
+        indexed swap first within a block."""
+        _insert_price(replay_db, ts=H0, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="pre",
+            block_timestamp=H0 - timedelta(hours=1),
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_price(replay_db, ts=H0 - timedelta(hours=1), price_usd=10.0, token_address=UNI)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="same_block",
+            block_timestamp=H0,
+            block_number=2,
+            qty=WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET, UNI)]
+        # Swap applied first (consuming the pre lot), then the transfer landed.
+        assert state.engine.balance_token() == Decimal(WEI)
+
+    def test_swap_legs_are_not_double_counted(self, replay_db):
+        """The transfer legs of this swap are in the cache and must be ignored.
+
+        Without dedup the sold side would be consumed twice and raise
+        InsufficientBalanceError, and the bought side would hold double.
+        """
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+        # The two legs AW_02 would have recorded for that same transaction.
+        _insert_qty(
+            replay_db,
+            unique_id="leg_uni",
+            block_timestamp=H1,
+            block_number=2,
+            qty=500 * WEI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        replay_db.execute(
+            "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                "ethereum",
+                2,
+                H1,
+                _tx(1),
+                None,
+                "leg_weth",
+                WETH,
+                UNI_WETH_POOL,
+                WALLET,
+                str(15 * 10**17),
+                18,
+            ],
+        )
+        replay_db.execute(
+            "UPDATE erc20_transfer SET tx_hash = ? WHERE unique_id = 'leg_uni'", [_tx(1)]
+        )
+        partitions = _process_events(replay_db)
+
+        sold = partitions[_key(WALLET, UNI)]
+        assert sold.has_insufficient_balance is False
+        assert len(sold.realizations) == 1
+        assert partitions[_key(WALLET, WETH)].engine.balance_token() == Decimal(15 * 10**17)
+
+    def test_missing_swap_table_degrades_to_transfers_only(self):
+        """A cache where AW_02 ran and AW_01 did not is a legitimate state."""
+        with connect(":memory:") as c:
+            create_erc20_tables(c)
+            create_price_tables(c)
+            _insert_price(c, ts=H0, price_usd=10.0, token_address=UNI)
+            _insert(c, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+            partitions = _process_events(c)
+        assert partitions[_key(WALLET, UNI)].engine.balance_token() == Decimal(WEI)
+
+    def test_replay_is_reproducible(self, replay_db):
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+
+        def snapshot():
+            return [
+                r.model_dump(exclude={"computed_at"})
+                for r in compute_wallet_pnl(replay_db, as_of=H2)
+            ]
+
+        assert snapshot() == snapshot()
