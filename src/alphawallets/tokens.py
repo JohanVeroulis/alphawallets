@@ -1,5 +1,20 @@
 """V1 token registry: symbol to contract address, per chain.
 
+Two kinds of entry, distinguished by QUOTE_ONLY_SYMBOLS:
+
+- **Subject tokens** (SUBJECT_SYMBOLS) — the twelve V1 tracks per CLAUDE.md
+  Section 2. These are what wallets are ranked on.
+- **Quote assets** (QUOTE_ONLY_SYMBOLS) — WETH and USDC. Tracked so a swap can
+  anchor its executed amount ratio to a USD price (ADR 0015), because every V1
+  pool is TOKEN/WETH and the ratio needs one trusted side. They are the
+  denominator of a trade, not the asset being traded, and are **not** leaderboard
+  subjects: ranking a wallet by its WETH PnL would rank it on the numeraire every
+  one of its trades passes through.
+
+Adding a quote asset is additive — one more ERC-20 transfer job and one more
+price job per chain. It does not change which pools AW_01 fetches, how AW_02
+treats the twelve subject tokens, or any downstream filter.
+
 Hardcoded and verified by hand, not auto-discovered. V1 tracks twelve tokens
 (CLAUDE.md Section 2) and the set changes rarely, so a dict beats fetching a
 token list at runtime on every count that matters here:
@@ -15,9 +30,12 @@ token list at runtime on every count that matters here:
 - The lookup is on the hot path of every fetcher invocation and must not fail
   because an endpoint is down.
 
-Every address below was verified on-chain on 2026-10-03 — Ethereum block
-26,110,150, Base block 52,110,584 — via symbol(), decimals() and totalSupply(),
-and independently confirmed to return a live DefiLlama price. Addresses are
+Every address below was verified on-chain via symbol(), decimals() and
+totalSupply(), and independently confirmed to return a live DefiLlama price on
+the `/chart` route AW_03 actually uses — the twelve subject tokens on 2026-10-03
+(Ethereum block 26,110,150, Base block 52,110,584) and the two quote assets on
+2026-10-08 (Ethereum block 26,140,298, Base block 52,292,120, 24/24 hourly
+points each at confidence 0.99). Addresses are
 stored lowercase because that is how the cache stores them and how every query
 compares them.
 
@@ -90,7 +108,53 @@ V1_TOKENS: dict[str, dict[Chain, str]] = {
     "ETHFI": {
         "ethereum": "0xfe0c30065b384f05761f15d0cc899d4f9f9cc0eb",
     },
+    # ----- Quote assets: see QUOTE_ONLY_SYMBOLS -----
+    #
+    # Tracked so swaps can anchor on them, not because a wallet's WETH or USDC
+    # position is interesting in itself. Every V1 pool is TOKEN/WETH (PR #28),
+    # and ADR 0015 prices a swap from the executed amount ratio combined with
+    # the quote side's hourly price — which requires that price to exist. It did
+    # not: PR #45's dry-run found 0 token_price rows for WETH on either chain,
+    # so no swap could be anchored and intra-hour PnL stayed at zero.
+    "WETH": {
+        "ethereum": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "base": "0x4200000000000000000000000000000000000006",
+    },
+    # NOTE: USDC is the first 6-decimal token in this registry; every other
+    # entry is 18. Amount scaling reads decimals per token rather than assuming,
+    # so nothing needs changing — but a hardcoded 18 anywhere will be wrong here
+    # for the first time.
+    #
+    # WARNING: Base has two USDC-ish tokens. This is the NATIVE Circle-issued
+    # USDC. The bridged USDbC (0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca)
+    # is a different token and must not be used. Unlike the two MORPHOs, these
+    # two ARE distinguishable by metadata — verified 2026-10-08, the bridged one
+    # reports symbol 'USDbC' and name 'USD Base Coin' against 'USDC' and
+    # 'USD Coin' — so the ADR 0008 metadata check is sufficient here.
+    "USDC": {
+        "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    },
 }
+
+QUOTE_ONLY_SYMBOLS: frozenset[str] = frozenset({"WETH", "USDC"})
+"""Tokens tracked only so swaps can be priced against them.
+
+A quote asset is the denominator of a trade, not the asset being traded. Its
+prices and transfers are fetched so ADR 0015 can anchor a swap's executed ratio
+to a USD figure — and nothing more. These symbols are deliberately **not**
+leaderboard subjects: ranking wallets by their WETH PnL would rank them on the
+numeraire every one of their trades passes through, which measures nothing about
+trading skill.
+
+Consumers that enumerate "the tokens V1 is about" should subtract this set.
+Consumers that need a price, a transfer history or a pool layout should not."""
+
+SUBJECT_SYMBOLS: frozenset[str] = frozenset(V1_TOKENS) - QUOTE_ONLY_SYMBOLS
+"""The twelve tokens V1 actually ranks wallets on (CLAUDE.md Section 2).
+
+Named so a caller does not have to perform the subtraction — and so the
+distinction is visible at the point of use rather than implied by a comment."""
 
 KNOWN_SYMBOLS: frozenset[str] = frozenset(V1_TOKENS)
 

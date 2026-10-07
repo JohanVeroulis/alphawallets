@@ -37,6 +37,8 @@ Anything not listed here is out of scope. If a task drifts outside it, stop and 
 - Upcoming-airdrop feed
 - Native BTC and XRP (data does not fit our use case)
 
+**Quote assets, not scope.** WETH and USDC are in the token registry (`src/alphawallets/tokens.py`) but are **not** leaderboard subjects — `QUOTE_ONLY_SYMBOLS` marks them and `SUBJECT_SYMBOLS` is still the twelve above. Every V1 pool is TOKEN/WETH, and [ADR 0015](docs/decisions/0015-per-swap-executed-price.md) prices a swap from its executed amount ratio anchored to the quote side's hourly price — which requires that price to exist. They are the denominator of a trade, not an asset V1 ranks wallets on; ranking a wallet by its WETH PnL would rank it on the numeraire every one of its trades passes through.
+
 ## 3. Tech Stack
 
 | Layer | Choice |

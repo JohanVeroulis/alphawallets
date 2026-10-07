@@ -30,6 +30,13 @@ Scope notes from ADR 0001, carried through ADR 0012 decision 4:
 - **MKR** has no airdrop in V1 scope — it predates the airdrop era and is
   tracked purely as a DeFi token. No entry.
 
+- **WETH and USDC** are quote assets (tokens.QUOTE_ONLY_SYMBOLS), tracked only
+  so swaps can anchor on their price (ADR 0015). They have no airdrop history
+  and `get_airdrop_record` returns None for both, which is correct: a
+  quote-asset transfer-IN classifies as trading, because receiving WETH from a
+  swap *is* a purchase. Reading their absence as a missing entry would be the
+  wrong conclusion — there is nothing to add.
+
 The remaining five airdrop tokens (UNI, ENA, EIGEN, MORPHO on Ethereum, ETHFI)
 require their distribution contract address(es) to be verified on-chain and
 listed below. The scaffolding and types are in place; adding a confirmed

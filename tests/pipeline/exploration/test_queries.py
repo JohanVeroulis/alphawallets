@@ -78,15 +78,33 @@ class TestPoolLayout:
             sides = {layout["token0"]["address"], layout["token1"]["address"]}
             assert sides & weth, f"{pool} has no WETH side"
 
-    def test_one_pool_per_token_chain_pair(self):
-        """A second pool for the same token on one chain would make the layout
-        ambiguous for pools_holding_token, which returns all matches."""
-        from alphawallets.tokens import all_token_chain_pairs, get_token_address
+    def test_one_pool_per_subject_token_chain_pair(self):
+        """A second pool for the same subject token on one chain would make the
+        layout ambiguous for pools_holding_token, which returns all matches.
+
+        Scoped to SUBJECT_SYMBOLS, not the whole registry: WETH is the quote side
+        of every V1 pool, so it legitimately maps to all of them. That is exactly
+        the distinction tokens.QUOTE_ONLY_SYMBOLS exists to express.
+        """
+        from alphawallets.tokens import (
+            SUBJECT_SYMBOLS,
+            all_token_chain_pairs,
+            get_token_address,
+        )
 
         for symbol, chain in all_token_chain_pairs():
+            if symbol not in SUBJECT_SYMBOLS:
+                continue
             address = get_token_address(symbol, chain)
             matches = pools_holding_token(address)
             assert len(matches) == 1, f"{symbol} on {chain} maps to {matches}"
+
+    def test_a_quote_asset_spans_many_pools(self):
+        """The companion to the above: WETH is in every pool by design."""
+        from alphawallets.tokens import get_token_address
+
+        weth = get_token_address("WETH", "ethereum")
+        assert len(pools_holding_token(weth)) > 1
 
     def test_pools_holding_unknown_token_is_empty(self):
         assert pools_holding_token("0x" + "7" * 40) == []
