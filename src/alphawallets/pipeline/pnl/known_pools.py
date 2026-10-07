@@ -35,6 +35,8 @@ happened.
 
 from __future__ import annotations
 
+from typing import Any
+
 from alphawallets.config import Chain
 from alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps import DEFAULT_POOLS_BY_CHAIN
 from alphawallets.pipeline.exploration.queries import POOL_TOKEN_LAYOUT
@@ -93,3 +95,25 @@ def get_pool_tokens(chain: Chain, pool_address: str) -> tuple[str, str]:
             "built without knowing which tokens a swap moves."
         )
     return layout["token0"]["address"], layout["token1"]["address"]
+
+
+def get_pool_layout(chain: Chain, pool_address: str) -> dict[str, Any]:
+    """Return a pool's full token layout: both slots with address and decimals.
+
+    `get_pool_tokens` answers "which two tokens", which is all the dedup set
+    needs. Pricing a swap also needs each side's decimals to turn a base-unit
+    amount into whole tokens, and the slot assignment to know which amount
+    belongs to which token — so this returns the layout entry itself.
+
+    Raises:
+        KeyError: If the pool is not in the layout, for the same reason
+            get_pool_tokens does.
+    """
+    layout = POOL_TOKEN_LAYOUT.get(pool_address.strip().lower())
+    if layout is None:
+        raise KeyError(
+            f"Pool {pool_address} is not in POOL_TOKEN_LAYOUT. Its swaps cannot "
+            "be priced without knowing which token sits in which slot and at "
+            "what decimals — a guess would misscale every amount."
+        )
+    return layout

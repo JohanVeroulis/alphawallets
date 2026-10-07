@@ -18,20 +18,22 @@ a pipeline stage never reaches a provider.
 
 from __future__ import annotations
 
+import heapq
 import logging
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
-from duckdb import DuckDBPyConnection
+from duckdb import CatalogException, DuckDBPyConnection
 
 from alphawallets.config import Chain
 from alphawallets.fetchers.erc20.models import ERC20Transfer
 from alphawallets.fetchers.uniswap_v3.models import UniswapV3Swap
 from alphawallets.pipeline.pnl.cost_basis import FIFOEngine, InsufficientBalanceError
-from alphawallets.pipeline.pnl.known_pools import get_pool_tokens
+from alphawallets.pipeline.pnl.known_pools import get_pool_layout, get_pool_tokens
 from alphawallets.pipeline.pnl.models import Realization, WalletPnL
 from alphawallets.pipeline.pnl.transfer_treatment import (
     TransferTreatment,
@@ -440,6 +442,123 @@ class PartitionState:
     slices this list by realized_at to produce per-window PnL (decision 9)."""
 
 
+def _merge_sort_key(event: ERC20Transfer | UniswapV3Swap) -> tuple:
+    """Chronological sort key shared by both event streams.
+
+    The FIFO engine does not sort (PR #33), so merging two already-ordered
+    streams has to preserve a single total order across both — the same
+    discipline as TRANSFER_ORDER_BY, expressed in Python because the merge
+    happens outside SQL.
+
+    log_index is NULL on every transfer row (ADR 0007) and never NULL on a swap,
+    so the (0, index) / (1, 0) pair reproduces NULLS LAST: within one block,
+    indexed swaps come before unindexed transfers rather than in whatever order
+    the merge happened to see them.
+
+    The kind discriminator and the identifier make the order total. Without them
+    a swap and a transfer tying on timestamp, block and index would merge
+    non-deterministically, and the FIFO cost basis would differ between runs over
+    the same cache — the failure the unique_id tiebreak exists to prevent on the
+    transfer side.
+    """
+    if isinstance(event, UniswapV3Swap):
+        return (event.block_timestamp, event.block_number, (0, event.log_index), 0, event.tx_hash)
+    log_sort = (0, event.log_index) if event.log_index is not None else (1, 0)
+    return (event.block_timestamp, event.block_number, log_sort, 1, event.unique_id)
+
+
+def _swap_sides(swap: UniswapV3Swap) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Split a swap into (sold side, bought side), or None if the signs are wrong.
+
+    Uniswap signs amounts from the pool's perspective: positive means the token
+    flowed INTO the pool, so the wallet sold it; negative means it flowed out, so
+    the wallet bought it. Exactly one of the two is positive in a well-formed
+    swap.
+
+    Returns None when that invariant does not hold — both signs equal, or an
+    amount of zero. Skipping is the only safe response: there is no way to tell
+    which side was sold, and guessing would invert a trade's direction.
+    """
+    layout = get_pool_layout(swap.chain, swap.pool_address)
+    slots = (
+        (swap.amount0, layout["token0"]),
+        (swap.amount1, layout["token1"]),
+    )
+    positive = [(amount, meta) for amount, meta in slots if amount > 0]
+    negative = [(amount, meta) for amount, meta in slots if amount < 0]
+    if len(positive) != 1 or len(negative) != 1:
+        return None
+
+    sold_amount, sold_meta = positive[0]
+    bought_amount, bought_meta = negative[0]
+    return (
+        {"amount": sold_amount, **sold_meta},
+        {"amount": -bought_amount, **bought_meta},
+    )
+
+
+# Tokens whose hourly price anchors a swap's executed ratio. Every V1 pool is
+# TOKEN/WETH (PR #28), and ADR 0015 relies on the quote side being
+# "grid-reliable" — a deep, continuously-traded asset whose hourly price is a
+# good estimate of its price at any instant inside that hour. USDC is listed for
+# the reference pool and for future non-WETH pairs.
+_QUOTE_SYMBOLS: frozenset[str] = frozenset({"WETH", "USDC"})
+
+
+def _whole(side: dict[str, Any]) -> Decimal:
+    """A side's amount in whole tokens, decimal-adjusted."""
+    return Decimal(side["amount"]) / (Decimal(10) ** side["decimals"])
+
+
+def _price_sides(
+    sold: dict[str, Any],
+    bought: dict[str, Any],
+    price_cache: dict[PriceCacheKey, float],
+    chain: str,
+    event_ts: datetime,
+) -> tuple[float, float] | None:
+    """Price both sides of a swap from one grid anchor and the executed ratio.
+
+    This is the point of ADR 0015. The hourly grid gives one price per hour, so
+    an intra-hour buy and sell collapse to the same number and PnL comes out
+    exactly zero — 65.4% of realizations in PR #42's measurement. The ratio the
+    swap actually executed at recovers that movement.
+
+    **The anchor is the quote side, not the bought side.** Anchoring on whichever
+    token the wallet received discards the executed ratio in the buy direction:
+    a wallet paying 1.5 WETH for 500 UNI with WETH at $2,000 and UNI at $12 on
+    the grid really paid $3,000, so its cost basis is $6.00 per UNI — but
+    pricing the bought side from the grid books $12.00, a $6,000 cost it never
+    paid, and silently throws away exactly the information this ADR exists to
+    use. Anchoring on the quote side prices both legs from one trusted number
+    and the ratio.
+
+    Returns:
+        (sold_unit_usd, bought_unit_usd), or None when no anchor can be priced.
+
+    All Decimal: the quantities are uint256-scale, and the division is where
+    float error would compound into the number that lands in realized PnL.
+    """
+    # Prefer a quote asset; fall back to whichever side has a price at all, so a
+    # future non-quote pair still prices rather than failing.
+    candidates = [side for side in (sold, bought) if side["symbol"].upper() in _QUOTE_SYMBOLS] or [
+        sold,
+        bought,
+    ]
+
+    for anchor in candidates:
+        anchor_usd = _lookup_price(price_cache, chain, anchor["address"], event_ts)
+        if anchor_usd is None:
+            continue
+        other = bought if anchor is sold else sold
+        other_usd = float(_whole(anchor) * Decimal(str(anchor_usd)) / _whole(other))
+        if anchor is sold:
+            return anchor_usd, other_usd
+        return other_usd, anchor_usd
+
+    return None
+
+
 def _process_events(
     conn: DuckDBPyConnection,
     chains: list[Chain] | None = None,
@@ -482,12 +601,31 @@ def _process_events(
     ignored_count = 0
     decimals_conflicts = 0
 
-    for transfer in _fetch_transfer_events(conn, chains=chains):
-        if as_of is not None and transfer.block_timestamp >= as_of:
+    # Swaps are read in full first: the dedup set has to exist before the first
+    # transfer is examined, since a transfer leg cannot be recognised as one
+    # until its swap is known (ADR 0015). The swap table is three orders of
+    # magnitude smaller than the transfer table, so this is cheap.
+    swaps = list(_fetch_swap_events(conn, chains=chains))
+    dedup_set = _build_swap_dedup_set(swaps)
+    transfers = _filter_transfers_by_dedup(_fetch_transfer_events(conn, chains=chains), dedup_set)
+
+    # heapq.merge over two already-sorted streams, rather than sorting their
+    # concatenation: both readers emit in order, so the merge is linear and the
+    # transfer side stays lazy.
+    merged = heapq.merge(swaps, transfers, key=_merge_sort_key)
+
+    for event in merged:
+        if as_of is not None and event.block_timestamp >= as_of:
             # Events are chronologically ordered, so the first one at or past
             # the cutoff means every remaining one is too. window_end is
             # exclusive (WalletPnL), so the boundary instant itself is excluded.
             break
+
+        if isinstance(event, UniswapV3Swap):
+            _apply_swap(event, partitions, price_cache, allowed)
+            continue
+
+        transfer = event
 
         # A set, not a pair: a self-transfer has from_addr == to_addr, and
         # processing it once per side would apply it twice to the same partition
@@ -626,6 +764,14 @@ def _process_events(
                     # trades. One Realization per lot consumed, each carrying
                     # its lot's source, which is what keeps decision 4's
                     # trading/airdrop split working on the realization side.
+                    #
+                    # NOT dead code under ADR 0015. The dedup set only removes
+                    # transfers whose swap is IN the cache, so a transfer to a
+                    # known pool with no corresponding swap row — a fetcher gap,
+                    # a decoding failure, AW_01 and AW_02 covering different
+                    # block ranges — still reaches here and is priced on the
+                    # hourly grid. This branch is the fallback for exactly the
+                    # case where the executed price is unavailable.
                     state.realizations.extend(realized)
                 continue
 
@@ -953,10 +1099,19 @@ def _fetch_swap_events(
         params.extend(wallets)
 
     where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
-    rows = conn.execute(
-        f"SELECT {_SWAP_COLUMNS} FROM uniswap_v3_swap {where} ORDER BY {SWAP_ORDER_BY}",
-        params,
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            f"SELECT {_SWAP_COLUMNS} FROM uniswap_v3_swap {where} ORDER BY {SWAP_ORDER_BY}",
+            params,
+        ).fetchall()
+    except CatalogException:
+        # No swap table: a cache where AW_02 has run and AW_01 has not, which is
+        # a legitimate state rather than an error. Yielding nothing degrades the
+        # run to transfer-only pricing — the pre-ADR-0015 behaviour — instead of
+        # failing. A pipeline stage should not crash because a fetcher has not
+        # run, which is the same reasoning route_cache.get_route follows.
+        logger.info("uniswap_v3_swap does not exist; no swap events to read")
+        return
 
     per_chain: Counter[str] = Counter()
     for row in rows:
@@ -1075,3 +1230,167 @@ def _filter_transfers_by_dedup(
         share,
         total,
     )
+
+
+def _apply_swap(
+    swap: UniswapV3Swap,
+    partitions: dict[PartitionKey, PartitionState],
+    price_cache: dict[PriceCacheKey, float],
+    allowed: set[str] | None,
+) -> None:
+    """Apply one swap to the selling and buying partitions.
+
+    ADR 0015: the trade is priced at what it executed at, not at the hour it
+    happened in. The sold side consumes from its FIFO stack and keeps the
+    Realizations; the bought side opens a lot.
+
+    The wallet is `tx_from` — the submitting EOA, per ADR 0012 decision 7, which
+    computes per-EOA and flags suspected smart-wallet mediation rather than
+    attempting to resolve it.
+    """
+    wallet = swap.tx_from
+    if allowed is not None and wallet not in allowed:
+        return
+
+    sides = _swap_sides(swap)
+    if sides is None:
+        logger.warning(
+            "Swap %s:%d has amounts that are not one positive and one negative "
+            "(amount0=%d, amount1=%d); skipped, because there is no way to tell "
+            "which side was sold",
+            swap.tx_hash,
+            swap.log_index,
+            swap.amount0,
+            swap.amount1,
+        )
+        return
+
+    sold, bought = sides
+    priced = _price_sides(sold, bought, price_cache, swap.chain, swap.block_timestamp)
+
+    sold_state = _ensure_partition(
+        partitions, (swap.chain, wallet, sold["address"]), wallet, sold["decimals"]
+    )
+    bought_state = _ensure_partition(
+        partitions, (swap.chain, wallet, bought["address"]), wallet, bought["decimals"]
+    )
+    for state in (sold_state, bought_state):
+        state.event_count += 1
+        if state.first_event_at is None:
+            state.first_event_at = swap.block_timestamp
+
+    sold_qty = Decimal(sold["amount"])
+    bought_qty = Decimal(bought["amount"])
+
+    if priced is None:
+        # Neither side has an hourly price, so the executed ratio has nothing to
+        # anchor to and neither leg can be valued.
+        #
+        # The sold side is still CONSUMED, deliberately diverging from the
+        # instruction to skip the swap entirely. Dedup has already removed both
+        # transfer legs from the stream, so nothing else will reduce the stack —
+        # skipping would leave the wallet holding tokens it has sold, overstating
+        # the balance and letting a later realization consume lots that were
+        # already gone. Same resolution as the unpriced pool-destination OUT in
+        # PR #40: reduce the stack, realize nothing, flag loudly.
+        #
+        # The bought side opens no lot, matching ADR 0012 decision 6's treatment
+        # of an unpriced acquisition: record the event, flag the partition, never
+        # invent a cost.
+        for state in (sold_state, bought_state):
+            state.has_unpriceable_events = True
+            state.unpriced_event_count += 1
+        bought_state.in_events.append(
+            LotEvent(occurred_at=swap.block_timestamp, unit_cost_usd=None, qty_token=bought_qty)
+        )
+        logger.warning(
+            "Swap %s:%d has no hourly price on either side (%s / %s on %s), so the "
+            "executed ratio cannot be anchored. Sold side consumed without a "
+            "realization and bought side opens no lot; both partitions flagged. "
+            "This wallet's PnL is understated.",
+            swap.tx_hash,
+            swap.log_index,
+            sold["symbol"],
+            bought["symbol"],
+            swap.chain,
+        )
+        _consume_or_flag(
+            sold_state, swap, wallet, sold["address"], sold_qty, _OUT_SALE_PRICE_UNUSED, keep=False
+        )
+        return
+
+    sold_unit_usd, bought_unit_usd = priced
+
+    _consume_or_flag(sold_state, swap, wallet, sold["address"], sold_qty, sold_unit_usd, keep=True)
+
+    # Both legs are priced from the same anchor and the same ratio, so the trade
+    # values identically from either side: qty_sold * sold_unit_usd equals
+    # qty_bought * bought_unit_usd by construction.
+    bought_state.engine.add_lot(
+        acquired_at=swap.block_timestamp,
+        qty_token=bought_qty,
+        unit_cost_usd=bought_unit_usd,
+        source="trading",
+    )
+    bought_state.in_events.append(
+        LotEvent(
+            occurred_at=swap.block_timestamp,
+            unit_cost_usd=bought_unit_usd,
+            qty_token=bought_qty,
+        )
+    )
+
+
+def _ensure_partition(
+    partitions: dict[PartitionKey, PartitionState],
+    key: PartitionKey,
+    wallet: str,
+    token_decimals: int,
+) -> PartitionState:
+    """Return the partition for a key, creating its engine on first use."""
+    state = partitions.get(key)
+    if state is None:
+        state = PartitionState(
+            engine=FIFOEngine(wallet=wallet, token_address=key[2], token_decimals=token_decimals)
+        )
+        partitions[key] = state
+    return state
+
+
+def _consume_or_flag(
+    state: PartitionState,
+    swap: UniswapV3Swap,
+    wallet: str,
+    token_address: str,
+    qty: Decimal,
+    unit_sale_usd: float,
+    *,
+    keep: bool,
+) -> None:
+    """Consume from a partition, keeping or discarding the Realizations.
+
+    Shares the insufficient-balance handling with the transfer path rather than
+    repeating it: a wallet that acquired its position before the indexed window
+    will sell what the stack never received, which is ADR 0012 decision 5's
+    has_pre_window_activity signal arriving by a third route.
+    """
+    try:
+        realized = state.engine.consume(
+            realized_at=swap.block_timestamp, qty_token=qty, unit_sale_usd=unit_sale_usd
+        )
+    except InsufficientBalanceError as e:
+        state.has_insufficient_balance = True
+        state.insufficient_balance_count += 1
+        logger.warning(
+            "Insufficient balance on swap %s:%d: chain=%s wallet=%s token=%s — %s",
+            swap.tx_hash,
+            swap.log_index,
+            swap.chain,
+            wallet,
+            token_address,
+            e,
+        )
+        return
+
+    if keep:
+        state.realizations.extend(realized)
