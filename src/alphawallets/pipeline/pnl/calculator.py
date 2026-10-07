@@ -2,8 +2,9 @@
 
 This module will eventually drive the whole PnL computation: read events, resolve
 prices, classify transfers, feed the FIFO engine, emit WalletPnL rows. **So far
-it reads events, resolves prices, and replays both through the classifier and
-the engine** — no WalletPnL emission and no window slicing yet.
+it reads events, resolves prices, replays them through the classifier and the
+engine, and books realizations for pool-destination sales** — no WalletPnL
+emission and no window slicing yet.
 
 Reading is a step worth isolating because of one hard constraint the engine
 imposes. `FIFOEngine` does not sort: it trusts that events arrive in the order
@@ -358,6 +359,13 @@ def _lookup_price(
 # API is ever added to the engine, this is the call site to change.
 _OUT_SALE_PRICE_UNUSED = 0.0
 
+# Both treatments that consume from the stack. They differ only in what happens
+# to the Realizations: a pool destination keeps them (ADR 0014), everything else
+# discards them (ADR 0012 decision 3). Sharing one dispatch branch keeps the
+# insufficient-balance handling in one place rather than two copies that can
+# drift.
+_OUTGOING_TREATMENTS = frozenset({TransferTreatment.OUT, TransferTreatment.TRADING_OUT_REALIZING})
+
 PartitionKey = tuple[str, str, str]
 """(chain, wallet, token_address) — the grain ADR 0012 decision 8 computes at.
 
@@ -389,10 +397,16 @@ class PartitionState:
     event_count: int = 0
 
     realizations: list[Realization] = field(default_factory=list)
-    """Realizations from events the wallet actually realized. Transfer-OUT
-    produces none by decision 3, so this stays empty until swap handling lands —
-    kept now so step D has somewhere to read them from rather than changing this
-    signature later."""
+    """Realizations the wallet actually booked, in consumption order.
+
+    Populated by transfers out to a known Uniswap V3 pool (ADR 0014), which are
+    the input legs of swaps and therefore sales at a knowable price. One entry
+    per lot consumed, so a sale spanning three lots appends three — and each
+    carries the source of the lot it consumed, which is how ADR 0012 decision
+    4's trading/airdrop split survives into realized PnL.
+
+    Transfer-OUT to anything else contributes nothing, by decision 3. Step D
+    slices this list by realized_at to produce per-window PnL (decision 9)."""
 
 
 def _process_events(
@@ -441,9 +455,11 @@ def _process_events(
                 continue
 
             key: PartitionKey = (transfer.chain, wallet, transfer.token_address)
-            # OUT takes no cost basis (decision 3), so a missing price for an
-            # outgoing transfer is not a gap — resolved before classification
-            # only because the classifier needs it for the IN treatments.
+            # One lookup, two possible roles. The token's market price at this
+            # hour is the cost basis if the wallet received, and the sale price
+            # if it sent to a pool (ADR 0014) — the same number either way, so
+            # resolving it twice would only invite the two to drift apart. The
+            # classifier decides which role applies and nulls the other.
             price = _lookup_price(
                 price_cache, transfer.chain, transfer.token_address, transfer.block_timestamp
             )
@@ -452,6 +468,7 @@ def _process_events(
                 wallet=wallet,
                 token_symbol=_token_symbol_for(transfer.chain, transfer.token_address),
                 unit_cost_usd=price,
+                unit_sale_usd=price,
             )
 
             if classification.treatment is TransferTreatment.IGNORED:
@@ -500,15 +517,43 @@ def _process_events(
             state.event_count += 1
             qty = Decimal(transfer.value_raw)
 
-            if classification.treatment is TransferTreatment.OUT:
+            if classification.treatment in _OUTGOING_TREATMENTS:
+                realizing = classification.treatment is TransferTreatment.TRADING_OUT_REALIZING
+                sale_price = classification.unit_sale_usd
+
+                if realizing and sale_price is None:
+                    # A pool destination with no price for that hour. The stack
+                    # must still be reduced — the wallet genuinely sent the
+                    # tokens, and leaving them in place would both overstate the
+                    # balance and let a later realization consume lots that were
+                    # already gone, misattributing their cost basis. So this
+                    # degrades to decision 3's treatment: consume, realize
+                    # nothing, and flag, because the realization we could not
+                    # price is a real gap in the PnL rather than a non-event.
+                    realizing = False
+                    state.has_unpriceable_events = True
+                    state.unpriced_event_count += 1
+                    logger.warning(
+                        "Pool-destination transfer with no price: %s at %s — pool=%s "
+                        "chain=%s wallet=%s token=%s. Stack reduced but no "
+                        "realization recorded; this wallet's PnL is understated.",
+                        transfer.unique_id,
+                        transfer.block_timestamp.isoformat(),
+                        transfer.to_addr,
+                        transfer.chain,
+                        wallet,
+                        transfer.token_address,
+                    )
+
                 try:
-                    # Realizations discarded: decision 3 reduces the balance
-                    # without realizing, because we cannot know whether the
-                    # wallet sold, paid, bridged or self-custodied.
-                    state.engine.consume(
+                    realized = state.engine.consume(
                         realized_at=transfer.block_timestamp,
                         qty_token=qty,
-                        unit_sale_usd=_OUT_SALE_PRICE_UNUSED,
+                        # The real sale price for a priced pool destination; the
+                        # sentinel for everything else, whose Realizations are
+                        # discarded because decision 3 cannot know whether the
+                        # wallet sold, paid, bridged or self-custodied.
+                        unit_sale_usd=sale_price if realizing else _OUT_SALE_PRICE_UNUSED,
                     )
                 except InsufficientBalanceError as e:
                     # Expected rather than exceptional: a wallet holding a
@@ -526,6 +571,14 @@ def _process_events(
                         transfer.token_address,
                         e,
                     )
+                    continue
+
+                if realizing:
+                    # ADR 0014: the counterparty is a pool, so these are real
+                    # trades. One Realization per lot consumed, each carrying
+                    # its lot's source, which is what keeps decision 4's
+                    # trading/airdrop split working on the realization side.
+                    state.realizations.extend(realized)
                 continue
 
             # Every remaining treatment creates a lot. AIRDROP_IN carries a
