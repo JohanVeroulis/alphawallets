@@ -11,11 +11,16 @@ things depending on direction and counterparty:
 - **Transfer-IN from anything else** is a purchase we cannot see the other half
   of — most often a CEX withdrawal. Cost basis is price-at-receipt (decision 2).
   Treating it as free would inflate PnL for the commonest wallet shape there is.
-- **Transfer-OUT** reduces the balance without realizing anything (decision 3).
-  We do not know whether the wallet sold on a CEX, paid a counterparty, bridged,
-  or moved to its own cold storage, so inventing a sale price would be a
-  fabrication and ignoring the event would leave a phantom balance. The engine's
-  `consume()` is called and its Realizations are discarded by the calculator.
+- **Transfer-OUT to a known Uniswap V3 pool** is a sale at a knowable price
+  (ADR 0014). A V3 swap emits two ERC-20 transfers, and this is the input leg —
+  the counterparty is known, so the Realizations are kept rather than discarded.
+  Without this, every unit of realized trading PnL from on-chain swaps is thrown
+  away, which is the signal ADR 0012 calls "the skill signal".
+- **Transfer-OUT anywhere else** reduces the balance without realizing anything
+  (decision 3). We do not know whether the wallet sold on a CEX, paid a
+  counterparty, bridged, or moved to its own cold storage, so inventing a sale
+  price would be a fabrication and ignoring the event would leave a phantom
+  balance. The engine's `consume()` is called and its Realizations are discarded.
 
 Pure Python: no DB, no network, no price lookups. The caller resolves
 price-at-receipt from the price table and passes it in — including passing None
@@ -37,6 +42,7 @@ from enum import Enum
 
 from alphawallets.fetchers.erc20.models import ERC20Transfer
 from alphawallets.pipeline.pnl.airdrop_registry import is_airdrop_distributor
+from alphawallets.pipeline.pnl.known_pools import is_known_pool
 from alphawallets.pipeline.pnl.models import LotSource
 
 logger = logging.getLogger(__name__)
@@ -52,7 +58,13 @@ class TransferTreatment(Enum):
     """add_lot() at price-at-receipt, source='trading'. ADR 0012 decision 2."""
 
     OUT = "out"
-    """consume() and discard the Realizations. ADR 0012 decision 3."""
+    """consume() and discard the Realizations. ADR 0012 decision 3 — the
+    counterparty is unknown, so no sale can be implied."""
+
+    TRADING_OUT_REALIZING = "trading_out_realizing"
+    """consume() and KEEP the Realizations, priced at unit_sale_usd. ADR 0014:
+    the destination is a known Uniswap V3 pool, so the counterparty is known and
+    the transfer is unambiguously the input leg of a swap."""
 
     SELF_TRANSFER = "self_transfer"
     """Treated as TRADING_IN, plus a flag. ADR 0012 decision 2's second
@@ -86,9 +98,21 @@ class TransferClassification:
     would produce exactly the plausible-but-wrong figure ADR 0012 exists to
     prevent."""
 
+    unit_sale_usd: float | None
+    """Sale price per whole token, for TRADING_OUT_REALIZING only. None for every
+    other treatment, including plain OUT — decision 3 realizes nothing, so a sale
+    price there would imply a trade that may not have happened.
+
+    Also None when the caller passed None for a realizing OUT: the price lookup
+    failed, and the calculator flags the row rather than pricing the sale at a
+    guess. An invented sale price is worse than an unpriced one, because it lands
+    in realized PnL and is indistinguishable from a measured figure."""
+
     source: LotSource | None
-    """The source to pass to engine.add_lot(). None for OUT and IGNORED, which
-    do not create a lot."""
+    """The source to pass to engine.add_lot(). None for both OUT treatments and
+    for IGNORED, which create no lot. A realizing OUT *consumes* lots, and each
+    Realization carries the source of the lot it consumed, so the treatment
+    itself does not carry one."""
 
     is_self_transfer: bool
     """True only for SELF_TRANSFER. Recorded for the calculator to propagate; no
@@ -101,6 +125,8 @@ def classify_transfer(
     wallet: str,
     token_symbol: str,
     unit_cost_usd: float | None,
+    *,
+    unit_sale_usd: float | None = None,
 ) -> TransferClassification:
     """Decide how one transfer should enter the FIFO engine.
 
@@ -117,7 +143,12 @@ def classify_transfer(
             registry for no gain.
         unit_cost_usd: Price-at-receipt per whole token, resolved by the caller.
             May be None when no price was available. Ignored for AIRDROP_IN and
-            the OUT treatments.
+            both OUT treatments.
+        unit_sale_usd: Price-at-sale per whole token, resolved by the caller from
+            the same price cache. Used only when the destination is a known V3
+            pool. Keyword-only and defaulting to None so every existing call site
+            keeps its meaning: a caller that does not know about realizing OUTs
+            cannot accidentally supply a sale price for one.
 
     Returns:
         A TransferClassification. Never raises on an unexpected wallet — see
@@ -133,6 +164,7 @@ def classify_transfer(
         return TransferClassification(
             treatment=TransferTreatment.SELF_TRANSFER,
             unit_cost_usd=unit_cost_usd,
+            unit_sale_usd=None,
             source="trading",
             is_self_transfer=True,
         )
@@ -146,20 +178,36 @@ def classify_transfer(
                 # non-None cost here means the caller resolved a price it should
                 # not have — honouring it would book a cost that was never paid.
                 unit_cost_usd=0.0,
+                unit_sale_usd=None,
                 source="airdrop",
                 is_self_transfer=False,
             )
         return TransferClassification(
             treatment=TransferTreatment.TRADING_IN,
             unit_cost_usd=unit_cost_usd,
+            unit_sale_usd=None,
             source="trading",
             is_self_transfer=False,
         )
 
     if is_sender:
+        if is_known_pool(transfer.chain, transfer.to_addr):
+            # ADR 0014 narrows decision 3: the destination is a pool AW_01
+            # fetches, so this is the input leg of a swap and the sale price is
+            # the outgoing token's market price at this timestamp. Keeping the
+            # Realizations here is the difference between a leaderboard that
+            # ranks trading skill and one that ranks nothing.
+            return TransferClassification(
+                treatment=TransferTreatment.TRADING_OUT_REALIZING,
+                unit_cost_usd=None,
+                unit_sale_usd=unit_sale_usd,
+                source=None,
+                is_self_transfer=False,
+            )
         return TransferClassification(
             treatment=TransferTreatment.OUT,
             unit_cost_usd=None,
+            unit_sale_usd=None,
             source=None,
             is_self_transfer=False,
         )
@@ -171,6 +219,7 @@ def classify_transfer(
     return TransferClassification(
         treatment=TransferTreatment.IGNORED,
         unit_cost_usd=None,
+        unit_sale_usd=None,
         source=None,
         is_self_transfer=False,
     )

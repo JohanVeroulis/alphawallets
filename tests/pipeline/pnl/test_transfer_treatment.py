@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from alphawallets.fetchers.erc20.models import ERC20Transfer
+from alphawallets.fetchers.uniswap_v3.aw_01_uniswap_v3_swaps import DEFAULT_POOLS_BY_CHAIN
 from alphawallets.pipeline.pnl import airdrop_registry
 from alphawallets.pipeline.pnl.airdrop_registry import (
     AirdropAttributionStatus,
@@ -26,6 +27,11 @@ UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
 ARB = "0xb50721bcf8d664c30412cfbc6cf7a15145234ad1"
 AAVE = "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9"
 MORPHO_BASE = "0xbaa5cc21fd487b8fcc2f632f3f4e8d37262a0842"
+LINK_BASE = "0x88fb150bdc53a65fe94dea0c9ba0a6daf8c6e196"
+
+# Configured V3 pools (ADR 0014). Real addresses, verified on-chain in PR #28.
+UNI_WETH_ETH = "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801"
+LINK_WETH_BASE = "0x224a5d3f2155f2f85af70b6d72aea61a15273ff4"
 
 T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 
@@ -314,7 +320,11 @@ class TestResultIsFrozen:
 
 class TestTreatmentEnum:
     def test_every_treatment_is_reachable(self):
-        """A value nothing produces is dead weight; this pins the mapping."""
+        """A value nothing produces is dead weight; this pins the mapping.
+
+        TRADING_OUT_REALIZING and AIRDROP_IN are covered separately: the first
+        needs a pool destination, the second a CONFIRMED registry entry.
+        """
         produced = {
             classify_transfer(transfer(OTHER, WALLET), WALLET, "UNI", 8.8).treatment,
             classify_transfer(transfer(WALLET, OTHER), WALLET, "UNI", None).treatment,
@@ -348,3 +358,135 @@ class TestTreatmentEnum:
         ]
         for result in cases:
             assert (result.source is not None) == (result.treatment in lot_creating)
+
+
+class TestOutToKnownPool:
+    """ADR 0014: the destination makes an OUT a realization or leaves it decision 3."""
+
+    def test_ethereum_pool_realizes(self):
+        result = classify_transfer(
+            transfer(WALLET, UNI_WETH_ETH), WALLET, "UNI", None, unit_sale_usd=12.0
+        )
+        assert result.treatment is TransferTreatment.TRADING_OUT_REALIZING
+        assert result.unit_sale_usd == 12.0
+
+    def test_base_pool_realizes(self):
+        result = classify_transfer(
+            transfer(WALLET, LINK_WETH_BASE, token_address=LINK_BASE, chain="base"),
+            WALLET,
+            "LINK",
+            None,
+            unit_sale_usd=14.0,
+        )
+        assert result.treatment is TransferTreatment.TRADING_OUT_REALIZING
+        assert result.unit_sale_usd == 14.0
+
+    def test_non_pool_destination_is_unchanged(self):
+        """A CEX-shaped address keeps decision 3: stack reduced, nothing realized."""
+        result = classify_transfer(transfer(WALLET, OTHER), WALLET, "UNI", None, unit_sale_usd=12.0)
+        assert result.treatment is TransferTreatment.OUT
+        assert result.unit_sale_usd is None
+
+    def test_pool_with_no_price_still_realizes(self):
+        """The treatment is decided by the destination, not by price availability.
+
+        A None sale price means the caller could not resolve one; the calculator
+        flags the row rather than pricing the sale at a guess, because an invented
+        sale price lands in realized PnL indistinguishable from a measured one.
+        """
+        result = classify_transfer(
+            transfer(WALLET, UNI_WETH_ETH), WALLET, "UNI", None, unit_sale_usd=None
+        )
+        assert result.treatment is TransferTreatment.TRADING_OUT_REALIZING
+        assert result.unit_sale_usd is None
+
+    def test_pool_address_on_the_wrong_chain_does_not_realize(self):
+        """(chain, address) is the key, not address alone.
+
+        The same hex on another chain is an unrelated account, and realizing
+        against it would book a sale that never happened.
+        """
+        result = classify_transfer(
+            transfer(WALLET, UNI_WETH_ETH, chain="base"),
+            WALLET,
+            "UNI",
+            None,
+            unit_sale_usd=12.0,
+        )
+        assert result.treatment is TransferTreatment.OUT
+        assert result.unit_sale_usd is None
+
+    def test_realizing_out_carries_no_cost_basis(self):
+        """It consumes lots; each Realization carries the source of the lot it
+        consumed, so the treatment itself has neither cost nor source."""
+        result = classify_transfer(
+            transfer(WALLET, UNI_WETH_ETH), WALLET, "UNI", 8.0, unit_sale_usd=12.0
+        )
+        assert result.unit_cost_usd is None
+        assert result.source is None
+        assert result.is_self_transfer is False
+
+    def test_incoming_from_a_pool_is_still_trading_in(self):
+        """The output leg of a swap: an acquisition at price-at-receipt, not a sale."""
+        result = classify_transfer(
+            transfer(UNI_WETH_ETH, WALLET), WALLET, "UNI", 8.0, unit_sale_usd=12.0
+        )
+        assert result.treatment is TransferTreatment.TRADING_IN
+        assert result.unit_cost_usd == 8.0
+        assert result.unit_sale_usd is None
+
+    def test_self_transfer_wins_over_the_pool_check(self):
+        """Ordering from PR #34 is preserved: self-transfer is tested first.
+
+        A pool sending to itself is not a wallet's trade.
+        """
+        result = classify_transfer(
+            transfer(UNI_WETH_ETH, UNI_WETH_ETH),
+            UNI_WETH_ETH,
+            "UNI",
+            8.0,
+            unit_sale_usd=12.0,
+        )
+        assert result.treatment is TransferTreatment.SELF_TRANSFER
+
+    def test_every_configured_pool_realizes(self):
+        """Derived from the config rather than spot-checked, so a new pool in
+        AW_01 is covered without editing this test."""
+        for chain, pools in DEFAULT_POOLS_BY_CHAIN.items():
+            for address in pools.values():
+                result = classify_transfer(
+                    transfer(WALLET, address.lower(), chain=chain),
+                    WALLET,
+                    "UNI",
+                    None,
+                    unit_sale_usd=12.0,
+                )
+                assert result.treatment is TransferTreatment.TRADING_OUT_REALIZING
+
+
+class TestUnitSaleUsdDefault:
+    """The parameter is keyword-only and defaults to None.
+
+    Every call site written before ADR 0014 omits it, so the default is what
+    keeps their meaning — a caller that does not know about realizing OUTs
+    cannot accidentally supply a sale price for one.
+    """
+
+    def test_omitting_it_leaves_a_pool_out_unpriced(self):
+        result = classify_transfer(transfer(WALLET, UNI_WETH_ETH), WALLET, "UNI", None)
+        assert result.treatment is TransferTreatment.TRADING_OUT_REALIZING
+        assert result.unit_sale_usd is None
+
+    def test_omitting_it_is_harmless_for_every_other_treatment(self):
+        for tx in (
+            transfer(OTHER, WALLET),
+            transfer(WALLET, OTHER),
+            transfer(WALLET, WALLET),
+            transfer(OTHER, THIRD),
+        ):
+            assert classify_transfer(tx, WALLET, "UNI", 8.0).unit_sale_usd is None
+
+    def test_cannot_be_passed_positionally(self):
+        """Keyword-only, so it cannot be mistaken for unit_cost_usd at a call site."""
+        with pytest.raises(TypeError):
+            classify_transfer(transfer(WALLET, UNI_WETH_ETH), WALLET, "UNI", None, 12.0)
