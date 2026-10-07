@@ -27,6 +27,8 @@ WALLET = "0x" + "1" * 40
 OTHER = "0x" + "2" * 40
 THIRD = "0x" + "3" * 40
 DISTRIBUTOR = "0x" + "d" * 40
+# UNI/WETH 0.3% on Ethereum — a configured pool (ADR 0014, verified in PR #28).
+UNI_WETH_POOL = "0x1d42064fc4beb5f8aaf85f4617ae8b3b5b8bd801"
 
 UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
 AAVE = "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9"
@@ -62,6 +64,37 @@ def _insert(
             to_addr,
             str(WEI),
             token_decimals,
+        ],
+    )
+
+
+def _insert_qty(
+    conn,
+    *,
+    unique_id: str,
+    block_timestamp: datetime,
+    block_number: int,
+    qty: int,
+    from_addr: str = OTHER,
+    to_addr: str = WALLET,
+    token_address: str = UNI,
+    chain: str = "ethereum",
+) -> None:
+    """Like _insert but with an explicit quantity, for PnL arithmetic tests."""
+    conn.execute(
+        "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            chain,
+            block_number,
+            block_timestamp,
+            "0x" + "a" * 64,
+            0,
+            unique_id,
+            token_address,
+            from_addr,
+            to_addr,
+            str(qty),
+            18,
         ],
     )
 
@@ -1182,3 +1215,319 @@ class TestEmptyAndEdgeCases:
             _process_events(replay_db)
         combined = "\n".join(r.getMessage() for r in caplog.records)
         assert "Replayed into 2 partition(s)" in combined
+
+
+class TestPoolDestinationRealization:
+    """ADR 0014: an OUT to a known V3 pool books a realization."""
+
+    def test_buy_then_sell_to_pool_books_pnl(self, replay_db):
+        """Bought at $10 (H0), sold to the pool at $12 (H1) → $2 on one token."""
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+
+        assert len(state.realizations) == 1
+        realization = state.realizations[0]
+        assert realization.qty_token == Decimal(WEI)
+        assert realization.unit_cost_usd == 10.0
+        assert realization.unit_sale_usd == 12.0
+        assert realization.pnl_usd == pytest.approx(2.0)
+        assert realization.source == "trading"
+        assert state.engine.balance_token() == Decimal(0)
+
+    def test_realization_timestamp_is_the_sale_not_the_purchase(self, replay_db):
+        """Decision 9 slices windows on realized_at, so this must be the sell."""
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.realizations[0].realized_at == H1
+
+    def test_partial_lot_realization(self, replay_db):
+        """Buy 100 @ $8, sell 60 to the pool @ $12 → $240, 40 left at $8."""
+        _insert_price(replay_db, ts=H0, price_usd=8.0, token_address=AAVE)
+        _insert_price(replay_db, ts=H1, price_usd=12.0, token_address=AAVE)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=100 * WEI,
+            token_address=AAVE,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            qty=60 * WEI,
+            token_address=AAVE,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET, AAVE)]
+
+        assert len(state.realizations) == 1
+        assert state.realizations[0].qty_token == Decimal(60 * WEI)
+        assert state.realizations[0].pnl_usd == pytest.approx(240.0)
+        assert state.engine.balance_token() == Decimal(40 * WEI)
+        assert state.engine.avg_cost_basis_usd() == pytest.approx(8.0)
+
+    def test_cross_source_consumption_splits_by_lot(self, replay_db, confirmed_uni_distributor):
+        """Buy 50 UNI @ $10 (H0), airdrop 50 (H1, zero cost), sell 80 @ $15 (H2).
+
+        FIFO is unified oldest-first (PR #33), so the trading lot goes first:
+        50 at trading -> (15-10)*50 = $250, then 30 at airdrop -> (15-0)*30 = $450.
+        This is ADR 0012 decision 4's split surviving into realized PnL, carried
+        by each lot's source rather than by the transfer that realized it.
+        """
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=50 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="drop",
+            block_timestamp=H1,
+            block_number=2,
+            qty=50 * WEI,
+            from_addr=confirmed_uni_distributor,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H2,
+            block_number=3,
+            qty=80 * WEI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+
+        assert len(state.realizations) == 2
+        first, second = state.realizations
+        assert (first.source, first.qty_token) == ("trading", Decimal(50 * WEI))
+        assert first.pnl_usd == pytest.approx(250.0)
+        assert (second.source, second.qty_token) == ("airdrop", Decimal(30 * WEI))
+        assert second.pnl_usd == pytest.approx(450.0)
+        # 20 airdrop tokens remain; the trading sub-stack is exhausted.
+        assert state.engine.balance_token_by_source() == {
+            "trading": Decimal(0),
+            "airdrop": Decimal(20 * WEI),
+        }
+
+    def test_no_price_books_nothing_but_still_reduces_the_stack(self, replay_db, caplog):
+        """A pool OUT at an unpriced hour.
+
+        The stack must still shrink: the wallet genuinely sent the tokens, and
+        leaving them would overstate the balance and let a later realization
+        consume lots that were already gone.
+        """
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H0 + timedelta(hours=9),
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            state = _process_events(replay_db)[_key(WALLET)]
+
+        assert state.realizations == []
+        assert state.has_unpriceable_events is True
+        assert state.unpriced_event_count == 1
+        assert state.engine.balance_token() == Decimal(0)
+
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Pool-destination transfer with no price" in combined
+        assert UNI_WETH_POOL in combined
+        assert "PnL is understated" in combined
+
+    def test_insufficient_balance_on_a_pool_out(self, replay_db, caplog):
+        """Same handling as the sentinel path — both route through consume()."""
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        with caplog.at_level(logging.WARNING):
+            state = _process_events(replay_db)[_key(WALLET)]
+
+        assert state.has_insufficient_balance is True
+        assert state.insufficient_balance_count == 1
+        assert state.realizations == []
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Insufficient balance" in combined
+
+    def test_replay_continues_after_an_insufficient_pool_sale(self, replay_db):
+        _insert(
+            replay_db,
+            unique_id="bad",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        _insert(replay_db, unique_id="buy", block_timestamp=H1, block_number=2, log_index=0)
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.has_insufficient_balance is True
+        assert state.engine.balance_token() == Decimal(WEI)
+
+    def test_non_pool_out_books_nothing_even_when_priced(self, replay_db):
+        """Decision 3 is unchanged: the price is irrelevant to an unknown counterparty."""
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="send",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+
+        assert state.realizations == []
+        assert state.has_unpriceable_events is False
+        # The stack still shrank — decision 3 reduces without realizing.
+        assert state.engine.balance_token() == Decimal(0)
+
+    def test_pool_on_the_wrong_chain_books_nothing(self, replay_db):
+        """(chain, address) is the key; an Ethereum pool address on Base is not a pool."""
+        _insert_price(replay_db, ts=H0, price_usd=10.0, token_address=UNI, chain="base")
+        _insert_price(replay_db, ts=H1, price_usd=12.0, token_address=UNI, chain="base")
+        _insert(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            chain="base",
+        )
+        _insert(
+            replay_db,
+            unique_id="send",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            chain="base",
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET, UNI, "base")]
+        assert state.realizations == []
+
+    def test_incoming_from_a_pool_is_an_acquisition(self, replay_db):
+        """The output leg of a swap builds a lot rather than booking a sale."""
+        _insert(
+            replay_db,
+            unique_id="swap_out",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=UNI_WETH_POOL,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.realizations == []
+        assert state.engine.balance_token() == Decimal(WEI)
+        assert state.engine.avg_cost_basis_usd() == pytest.approx(10.0)
+
+    def test_multiple_sales_accumulate_in_order(self, replay_db):
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=2 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="s1",
+            block_timestamp=H1,
+            block_number=2,
+            qty=WEI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="s2",
+            block_timestamp=H2,
+            block_number=3,
+            qty=WEI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert [r.realized_at for r in state.realizations] == [H1, H2]
+        assert [r.unit_sale_usd for r in state.realizations] == [12.0, 15.0]
+
+    def test_loss_is_booked_as_a_negative(self, replay_db):
+        """Bought at $15 (H2), sold at $10 (H0) is impossible chronologically, so
+        buy at H2 and sell later at an hour priced lower."""
+        _insert_price(replay_db, ts=H2 + timedelta(hours=1), price_usd=5.0, token_address=UNI)
+        _insert(replay_db, unique_id="buy", block_timestamp=H2, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H2 + timedelta(hours=1),
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.realizations[0].pnl_usd == pytest.approx(-10.0)
+
+    def test_pool_partition_also_exists_and_books_nothing(self, replay_db):
+        """The pool is the receiver, so it gets a partition of its own — a lot,
+        not a realization. Harmless, and filtered out by wallet_filter in practice."""
+        _insert(replay_db, unique_id="buy", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        partitions = _process_events(replay_db)
+        pool_state = partitions[_key(UNI_WETH_POOL)]
+        assert pool_state.realizations == []
+        assert pool_state.engine.balance_token() == Decimal(WEI)
