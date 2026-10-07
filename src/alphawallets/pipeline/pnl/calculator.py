@@ -2,8 +2,8 @@
 
 This module will eventually drive the whole PnL computation: read events, resolve
 prices, classify transfers, feed the FIFO engine, emit WalletPnL rows. **So far
-it contains the data-reading and price layers only** — no FIFO logic, no
-classification, no WalletPnL emission.
+it reads events, resolves prices, and replays both through the classifier and
+the engine** — no WalletPnL emission and no window slicing yet.
 
 Reading is a step worth isolating because of one hard constraint the engine
 imposes. `FIFOEngine` does not sort: it trusts that events arrive in the order
@@ -21,12 +21,21 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from duckdb import DuckDBPyConnection
 
 from alphawallets.config import Chain
 from alphawallets.fetchers.erc20.models import ERC20Transfer
+from alphawallets.pipeline.pnl.cost_basis import FIFOEngine, InsufficientBalanceError
+from alphawallets.pipeline.pnl.models import Realization
+from alphawallets.pipeline.pnl.transfer_treatment import (
+    TransferTreatment,
+    classify_transfer,
+)
+from alphawallets.tokens import V1_TOKENS
 
 logger = logging.getLogger(__name__)
 
@@ -336,3 +345,240 @@ def _lookup_price(
         The price, or None when that hour has no row.
     """
     return cache.get((chain, token_address.lower(), _hour_utc(event_ts)))
+
+
+# ---------- Event replay ----------
+
+
+# A transfer-OUT reduces the FIFO stack without realizing anything (ADR 0012
+# decision 3), but the engine's only consumption API returns Realizations and
+# requires a sale price to build them. We pass this sentinel and discard the
+# result: the value never leaves the function, and OUT carries no cost basis by
+# decision 3, so there is no number to get wrong. If a consume-without-realizing
+# API is ever added to the engine, this is the call site to change.
+_OUT_SALE_PRICE_UNUSED = 0.0
+
+PartitionKey = tuple[str, str, str]
+"""(chain, wallet, token_address) — the grain ADR 0012 decision 8 computes at.
+
+FIFO is only meaningful within one asset, and a wallet's UNI stack has nothing
+to do with its AAVE stack, so one engine per triple. The leaderboard aggregates
+to per-wallet at report time.
+"""
+
+
+@dataclass
+class PartitionState:
+    """One (chain, wallet, token) partition's engine plus what went wrong in it.
+
+    Mutable, unlike every model in this package: it accumulates across the replay
+    rather than describing a finished fact.
+
+    The flags are raised here and consumed in step D, where they become columns
+    on the WalletPnL row (ADR 0012 decisions 5, 6, 7). They are counted as well
+    as flagged because "one unpriced event out of 500" and "480 out of 500" are
+    very different statements about how much of a PnL figure to trust, and a
+    bare boolean cannot tell them apart.
+    """
+
+    engine: FIFOEngine
+    has_unpriceable_events: bool = False
+    has_insufficient_balance: bool = False
+    unpriced_event_count: int = 0
+    insufficient_balance_count: int = 0
+    event_count: int = 0
+
+    realizations: list[Realization] = field(default_factory=list)
+    """Realizations from events the wallet actually realized. Transfer-OUT
+    produces none by decision 3, so this stays empty until swap handling lands —
+    kept now so step D has somewhere to read them from rather than changing this
+    signature later."""
+
+
+def _process_events(
+    conn: DuckDBPyConnection,
+    chains: list[Chain] | None = None,
+    wallet_filter: list[str] | None = None,
+) -> dict[PartitionKey, PartitionState]:
+    """Replay every transfer through the classifier and the FIFO engine.
+
+    Reads events in the deterministic order from _fetch_transfer_events, which is
+    what satisfies the engine's chronological-ordering contract — the engine does
+    not sort, and out-of-order events produce a wrong cost basis silently.
+
+    Args:
+        conn: Open DuckDB connection to the cache.
+        chains: Restrict to these chains. Passed through to both the event read
+            and the price load. None means every chain; [] means none.
+        wallet_filter: Only build partitions for these wallets, any case. Applied
+            at wallet selection rather than in SQL — pushing it into the query is
+            a later optimisation, and doing it here keeps one definition of which
+            wallets a transfer touches.
+
+    Returns:
+        Every partition the replay created, keyed by (chain, wallet, token).
+
+    Notes:
+        No WalletPnL emission and no window slicing. A partition's state is the
+        running cost basis over all visible history, which is exactly what ADR
+        0012 decision 9 specifies: one engine state, and windows differ only in
+        which realizations they count.
+    """
+    price_cache = _load_price_cache(conn, chains=chains)
+    allowed = {w.strip().lower() for w in wallet_filter} if wallet_filter is not None else None
+
+    partitions: dict[PartitionKey, PartitionState] = {}
+    ignored_count = 0
+    decimals_conflicts = 0
+
+    for transfer in _fetch_transfer_events(conn, chains=chains):
+        # A set, not a pair: a self-transfer has from_addr == to_addr, and
+        # processing it once per side would apply it twice to the same partition
+        # — adding the lot, then adding it again. classify_transfer returns
+        # SELF_TRANSFER for that wallet, which is the single correct treatment.
+        for wallet in {transfer.from_addr, transfer.to_addr}:
+            if allowed is not None and wallet not in allowed:
+                continue
+
+            key: PartitionKey = (transfer.chain, wallet, transfer.token_address)
+            # OUT takes no cost basis (decision 3), so a missing price for an
+            # outgoing transfer is not a gap — resolved before classification
+            # only because the classifier needs it for the IN treatments.
+            price = _lookup_price(
+                price_cache, transfer.chain, transfer.token_address, transfer.block_timestamp
+            )
+            classification = classify_transfer(
+                transfer=transfer,
+                wallet=wallet,
+                token_symbol=_token_symbol_for(transfer.chain, transfer.token_address),
+                unit_cost_usd=price,
+            )
+
+            if classification.treatment is TransferTreatment.IGNORED:
+                # The wallet came from this transfer's own addresses, so it is
+                # always a party — reaching here means the selection above and
+                # the classifier disagree, which is a bug in one of them.
+                ignored_count += 1
+                logger.debug(
+                    "IGNORED for wallet %s on %s — wallet selection and classifier disagree",
+                    wallet,
+                    transfer.unique_id,
+                )
+                continue
+
+            state = partitions.get(key)
+            if state is None:
+                state = PartitionState(
+                    engine=FIFOEngine(
+                        wallet=wallet,
+                        token_address=transfer.token_address,
+                        # From the row rather than a default: ADR 0012's whole
+                        # premise is that a wrong scale produces a plausible
+                        # number, and _fetch_transfer_events has already dropped
+                        # rows where this is NULL.
+                        token_decimals=transfer.token_decimals,
+                    )
+                )
+                partitions[key] = state
+            elif state.engine.token_decimals != transfer.token_decimals:
+                # Same token reporting two different decimals across rows. Not
+                # fatal — the first value keeps the stack self-consistent — but
+                # it means one set of amounts is misscaled, so it must not pass
+                # silently.
+                decimals_conflicts += 1
+                logger.warning(
+                    "token_decimals conflict for %s on %s: engine built with %d, "
+                    "row %s reports %d. Keeping the engine's value; amounts from "
+                    "one of the two are misscaled.",
+                    transfer.token_address,
+                    transfer.chain,
+                    state.engine.token_decimals,
+                    transfer.unique_id,
+                    transfer.token_decimals,
+                )
+
+            state.event_count += 1
+            qty = Decimal(transfer.value_raw)
+
+            if classification.treatment is TransferTreatment.OUT:
+                try:
+                    # Realizations discarded: decision 3 reduces the balance
+                    # without realizing, because we cannot know whether the
+                    # wallet sold, paid, bridged or self-custodied.
+                    state.engine.consume(
+                        realized_at=transfer.block_timestamp,
+                        qty_token=qty,
+                        unit_sale_usd=_OUT_SALE_PRICE_UNUSED,
+                    )
+                except InsufficientBalanceError as e:
+                    # Expected rather than exceptional: a wallet holding a
+                    # balance before the indexed window starts will send tokens
+                    # the stack never received. That is ADR 0012 decision 5's
+                    # has_pre_window_activity signal arriving early — step D
+                    # should read this flag as evidence for it.
+                    state.has_insufficient_balance = True
+                    state.insufficient_balance_count += 1
+                    logger.warning(
+                        "Insufficient balance on %s: chain=%s wallet=%s token=%s — %s",
+                        transfer.unique_id,
+                        transfer.chain,
+                        wallet,
+                        transfer.token_address,
+                        e,
+                    )
+                continue
+
+            # Every remaining treatment creates a lot. AIRDROP_IN carries a
+            # forced 0.0; TRADING_IN and SELF_TRANSFER carry the resolved price.
+            if classification.unit_cost_usd is None:
+                # Decision 6: keep the event, flag the row, do not invent a cost.
+                # MKR's 4-hour grid guarantees this path runs on live data.
+                state.has_unpriceable_events = True
+                state.unpriced_event_count += 1
+                logger.debug(
+                    "No price for %s at %s; lot skipped and partition flagged",
+                    transfer.token_address,
+                    transfer.block_timestamp.isoformat(),
+                )
+                continue
+
+            assert classification.source is not None, "lot-creating treatment without a source"
+            state.engine.add_lot(
+                acquired_at=transfer.block_timestamp,
+                qty_token=qty,
+                unit_cost_usd=classification.unit_cost_usd,
+                source=classification.source,
+            )
+
+    if ignored_count:
+        logger.warning(
+            "%d event(s) classified IGNORED despite the wallet coming from the "
+            "transfer's own addresses — investigate wallet selection",
+            ignored_count,
+        )
+    if decimals_conflicts:
+        logger.warning("%d token_decimals conflict(s) across the replay", decimals_conflicts)
+
+    flagged_unpriced = sum(1 for s in partitions.values() if s.has_unpriceable_events)
+    flagged_balance = sum(1 for s in partitions.values() if s.has_insufficient_balance)
+    logger.info(
+        "Replayed into %d partition(s): %d with unpriced events, %d with insufficient balance",
+        len(partitions),
+        flagged_unpriced,
+        flagged_balance,
+    )
+    return partitions
+
+
+def _token_symbol_for(chain: str, token_address: str) -> str:
+    """Resolve a token address to its V1 registry symbol for the airdrop lookup.
+
+    classify_transfer keys the airdrop registry on symbol and chain, so the
+    address has to be mapped. An unknown address returns a sentinel that matches
+    no registry entry, which routes the transfer to TRADING_IN — the correct
+    default for a token with no airdrop in V1 scope.
+    """
+    for symbol, addresses in V1_TOKENS.items():
+        if addresses.get(chain) == token_address.lower():
+            return symbol
+    return "__UNKNOWN__"
