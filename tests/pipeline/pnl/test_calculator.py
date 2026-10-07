@@ -2,6 +2,7 @@
 
 import logging
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -9,16 +10,23 @@ from alphawallets.db import connect
 from alphawallets.fetchers.erc20.models import ERC20Transfer
 from alphawallets.fetchers.erc20.writer import create_tables as create_erc20_tables
 from alphawallets.fetchers.prices.writer import create_tables as create_price_tables
+from alphawallets.pipeline.pnl import airdrop_registry
+from alphawallets.pipeline.pnl.airdrop_registry import (
+    AirdropAttributionStatus,
+    AirdropRecord,
+)
 from alphawallets.pipeline.pnl.calculator import (
     TRANSFER_ORDER_BY,
     _fetch_transfer_events,
     _load_price_cache,
     _lookup_price,
+    _process_events,
 )
 
 WALLET = "0x" + "1" * 40
 OTHER = "0x" + "2" * 40
 THIRD = "0x" + "3" * 40
+DISTRIBUTOR = "0x" + "d" * 40
 
 UNI = "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"
 AAVE = "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9"
@@ -628,3 +636,549 @@ class TestLookupPrice:
 
     def test_empty_cache_returns_none(self):
         assert _lookup_price({}, "ethereum", UNI, H0) is None
+
+
+# ---------- Event replay ----------
+
+
+@pytest.fixture
+def replay_db():
+    """A cache with both tables created and UNI priced for three hours."""
+    with connect(":memory:") as c:
+        create_erc20_tables(c)
+        create_price_tables(c)
+        _insert_price(c, ts=H0, price_usd=10.0, token_address=UNI)
+        _insert_price(c, ts=H1, price_usd=12.0, token_address=UNI)
+        _insert_price(c, ts=H2, price_usd=15.0, token_address=UNI)
+        yield c
+
+
+@pytest.fixture
+def confirmed_uni_distributor(monkeypatch):
+    """Promote UNI/ethereum to CONFIRMED so the AIRDROP_IN path is reachable.
+
+    No production entry is CONFIRMED yet, so this is the only way to exercise it.
+    Patches the registry dict rather than stubbing the lookup, so AirdropRecord's
+    own invariants run too.
+    """
+    record = AirdropRecord(
+        token_symbol="UNI",
+        chain="ethereum",
+        status=AirdropAttributionStatus.CONFIRMED,
+        distributors=frozenset({DISTRIBUTOR}),
+        note="Test fixture only — not a verified address.",
+    )
+    monkeypatch.setitem(airdrop_registry._REGISTRY, ("UNI", "ethereum"), record)
+    return DISTRIBUTOR
+
+
+def _key(wallet: str, token: str = UNI, chain: str = "ethereum"):
+    return (chain, wallet, token)
+
+
+class TestReceiveThenSend:
+    def test_receive_builds_a_lot(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        partitions = _process_events(replay_db)
+
+        state = partitions[_key(WALLET)]
+        assert state.engine.balance_token() == Decimal(WEI)
+        assert state.engine.avg_cost_basis_usd() == pytest.approx(10.0)
+        assert state.event_count == 1
+
+    def test_send_consumes_the_lot(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="out",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        partitions = _process_events(replay_db)
+
+        sender = partitions[_key(WALLET)]
+        assert sender.engine.balance_token() == Decimal(0)
+        assert sender.has_insufficient_balance is False
+        # Decision 3: the stack shrank but nothing was realized.
+        assert sender.realizations == []
+
+    def test_both_sides_of_a_transfer_get_partitions(self, replay_db):
+        """One event, two wallets, each with its own engine."""
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        partitions = _process_events(replay_db)
+        assert _key(WALLET) in partitions  # receiver, holds a lot
+        assert _key(OTHER) in partitions  # sender, tried to consume
+
+    def test_partial_send_leaves_a_balance(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        replay_db.execute(
+            "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ["ethereum", 2, H1, "0x" + "a" * 64, 0, "out", UNI, WALLET, OTHER, str(WEI // 4), 18],
+        )
+        partitions = _process_events(replay_db)
+        assert partitions[_key(WALLET)].engine.balance_token() == Decimal(WEI - WEI // 4)
+
+    def test_cost_basis_is_priced_at_the_receipt_hour(self, replay_db):
+        """Decision 2: two receipts at different hours take different costs."""
+        _insert(replay_db, unique_id="a", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(replay_db, unique_id="b", block_timestamp=H2, block_number=2, log_index=0)
+        state = _process_events(replay_db)[_key(WALLET)]
+        # (10 + 15) / 2 across equal quantities.
+        assert state.engine.avg_cost_basis_usd() == pytest.approx(12.5)
+        assert [lot.unit_cost_usd for lot in state.engine.lots_snapshot()] == [10.0, 15.0]
+
+
+class TestSelfTransfer:
+    def test_applied_once_not_twice(self, replay_db):
+        """from_addr == to_addr: iterating a pair would add the lot twice.
+
+        The wallet set collapses to one entry, and classify_transfer returns
+        SELF_TRANSFER for it — the single correct treatment.
+        """
+        _insert(
+            replay_db,
+            unique_id="self",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=WALLET,
+        )
+        partitions = _process_events(replay_db)
+        state = partitions[_key(WALLET)]
+        assert state.event_count == 1
+        assert state.engine.balance_token() == Decimal(WEI)
+        assert len(state.engine.lots_snapshot()) == 1
+
+    def test_creates_only_one_partition(self, replay_db):
+        _insert(
+            replay_db,
+            unique_id="self",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=WALLET,
+        )
+        assert len(_process_events(replay_db)) == 1
+
+    def test_treated_as_trading_for_v1(self, replay_db):
+        _insert(
+            replay_db,
+            unique_id="self",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.engine.balance_token_by_source()["trading"] == Decimal(WEI)
+        assert state.engine.balance_token_by_source()["airdrop"] == Decimal(0)
+
+
+class TestTwoWalletsOverlapping:
+    def test_partitions_are_independent(self, replay_db):
+        """A chain of transfers: OTHER -> WALLET -> THIRD."""
+        _insert(
+            replay_db,
+            unique_id="a",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert(
+            replay_db,
+            unique_id="b",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=THIRD,
+        )
+        partitions = _process_events(replay_db)
+
+        assert partitions[_key(WALLET)].engine.balance_token() == Decimal(0)
+        assert partitions[_key(THIRD)].engine.balance_token() == Decimal(WEI)
+        # THIRD received at H1, so its cost basis is that hour's price.
+        assert partitions[_key(THIRD)].engine.avg_cost_basis_usd() == pytest.approx(12.0)
+
+    def test_separate_tokens_get_separate_partitions(self, replay_db):
+        """FIFO is only meaningful within one asset (decision 8)."""
+        _insert_price(replay_db, ts=H0, price_usd=180.0, token_address=AAVE)
+        _insert(replay_db, unique_id="uni", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="aave",
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            token_address=AAVE,
+        )
+        partitions = _process_events(replay_db)
+        assert _key(WALLET, UNI) in partitions
+        assert _key(WALLET, AAVE) in partitions
+        assert partitions[_key(WALLET, AAVE)].engine.avg_cost_basis_usd() == pytest.approx(180.0)
+
+    def test_separate_chains_get_separate_partitions(self, replay_db):
+        _insert_price(replay_db, ts=H0, price_usd=9.0, token_address=UNI, chain="base")
+        _insert(replay_db, unique_id="eth", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="base",
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            chain="base",
+        )
+        partitions = _process_events(replay_db)
+        assert partitions[_key(WALLET, UNI, "ethereum")].engine.avg_cost_basis_usd() == (
+            pytest.approx(10.0)
+        )
+        assert partitions[_key(WALLET, UNI, "base")].engine.avg_cost_basis_usd() == (
+            pytest.approx(9.0)
+        )
+
+
+class TestUnpriceableFlag:
+    def test_missing_price_flips_the_flag(self, replay_db):
+        """H0+5h has no price row — the MKR-grid shape (decision 6)."""
+        _insert(
+            replay_db,
+            unique_id="unpriced",
+            block_timestamp=H0 + timedelta(hours=5),
+            block_number=1,
+            log_index=0,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.has_unpriceable_events is True
+        assert state.unpriced_event_count == 1
+
+    def test_unpriced_receipt_creates_no_lot(self, replay_db):
+        """No cost is invented, so no lot — the event is counted and flagged."""
+        _insert(
+            replay_db,
+            unique_id="unpriced",
+            block_timestamp=H0 + timedelta(hours=5),
+            block_number=1,
+            log_index=0,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.engine.balance_token() == Decimal(0)
+        assert state.event_count == 1
+
+    def test_flag_is_false_when_everything_is_priced(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.has_unpriceable_events is False
+        assert state.unpriced_event_count == 0
+
+    def test_counts_distinguish_one_gap_from_many(self, replay_db):
+        """A bare boolean cannot tell 1-in-500 from 480-in-500."""
+        for i in range(3):
+            _insert(
+                replay_db,
+                unique_id=f"u{i}",
+                block_timestamp=H0 + timedelta(hours=5 + i),
+                block_number=i,
+                log_index=0,
+            )
+        _insert(replay_db, unique_id="ok", block_timestamp=H0, block_number=99, log_index=0)
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.unpriced_event_count == 3
+        assert state.event_count == 4
+
+    def test_an_unpriced_send_does_not_flag(self, replay_db):
+        """OUT takes no cost basis (decision 3), so a missing price is not a gap."""
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="out",
+            block_timestamp=H0 + timedelta(hours=5),
+            block_number=2,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.has_unpriceable_events is False
+        assert state.engine.balance_token() == Decimal(0)
+
+
+class TestAirdropEntry:
+    def test_distributor_receipt_is_zero_cost_airdrop(self, replay_db, confirmed_uni_distributor):
+        _insert(
+            replay_db,
+            unique_id="drop",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=confirmed_uni_distributor,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.engine.balance_token_by_source()["airdrop"] == Decimal(WEI)
+        assert state.engine.avg_cost_basis_usd() == 0.0
+
+    def test_airdrop_ignores_the_resolved_price(self, replay_db, confirmed_uni_distributor):
+        """H0 has a $10 price; an airdrop lot must still be zero-cost."""
+        _insert(
+            replay_db,
+            unique_id="drop",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=confirmed_uni_distributor,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.engine.lots_snapshot()[0].unit_cost_usd == 0.0
+        assert state.engine.lots_snapshot()[0].source == "airdrop"
+
+    def test_mixed_airdrop_and_trading_lots(self, replay_db, confirmed_uni_distributor):
+        _insert(
+            replay_db,
+            unique_id="drop",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=confirmed_uni_distributor,
+            to_addr=WALLET,
+        )
+        _insert(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.engine.balance_token_by_source() == {
+            "airdrop": Decimal(WEI),
+            "trading": Decimal(WEI),
+        }
+        # (0 + 12) / 2 — airdrop lots pull the average down proportionally.
+        assert state.engine.avg_cost_basis_usd() == pytest.approx(6.0)
+
+    def test_non_distributor_sender_of_the_same_token_is_trading(
+        self, replay_db, confirmed_uni_distributor
+    ):
+        _insert(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.engine.balance_token_by_source()["trading"] == Decimal(WEI)
+
+
+class TestInsufficientBalance:
+    def test_caught_and_flagged_not_raised(self, replay_db):
+        """A wallet sending tokens the stack never received — the pre-window shape."""
+        _insert(
+            replay_db,
+            unique_id="out",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        partitions = _process_events(replay_db)
+        state = partitions[_key(WALLET)]
+        assert state.has_insufficient_balance is True
+        assert state.insufficient_balance_count == 1
+
+    def test_processing_continues_after_the_error(self, replay_db):
+        """One bad event must not abandon the rest of the replay."""
+        _insert(
+            replay_db,
+            unique_id="bad",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        _insert(
+            replay_db,
+            unique_id="good",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.has_insufficient_balance is True
+        # The later receipt still landed.
+        assert state.engine.balance_token() == Decimal(WEI)
+        assert state.event_count == 2
+
+    def test_logged_with_the_diagnostic_values(self, replay_db, caplog):
+        _insert(
+            replay_db,
+            unique_id="out",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        with caplog.at_level(logging.WARNING):
+            _process_events(replay_db)
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Insufficient balance" in combined
+        assert WALLET in combined
+        assert UNI in combined
+        assert "ethereum" in combined
+
+    def test_other_partitions_are_unaffected(self, replay_db):
+        _insert(
+            replay_db,
+            unique_id="bad",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        partitions = _process_events(replay_db)
+        assert partitions[_key(OTHER)].has_insufficient_balance is False
+        assert partitions[_key(OTHER)].engine.balance_token() == Decimal(WEI)
+
+    def test_counts_accumulate(self, replay_db):
+        for i in range(3):
+            _insert(
+                replay_db,
+                unique_id=f"out{i}",
+                block_timestamp=H0,
+                block_number=i,
+                log_index=i,
+                from_addr=WALLET,
+                to_addr=OTHER,
+            )
+        state = _process_events(replay_db)[_key(WALLET)]
+        assert state.insufficient_balance_count == 3
+
+
+class TestWalletFilter:
+    def test_restricts_which_partitions_are_built(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        partitions = _process_events(replay_db, wallet_filter=[WALLET])
+        assert set(partitions) == {_key(WALLET)}
+
+    def test_is_case_insensitive(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        partitions = _process_events(replay_db, wallet_filter=[WALLET.upper()])
+        assert set(partitions) == {_key(WALLET)}
+
+    def test_empty_filter_builds_nothing(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        assert _process_events(replay_db, wallet_filter=[]) == {}
+
+    def test_none_builds_every_wallet(self, replay_db):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        assert len(_process_events(replay_db)) == 2
+
+    def test_chain_filter_restricts(self, replay_db):
+        _insert_price(replay_db, ts=H0, price_usd=9.0, token_address=UNI, chain="base")
+        _insert(replay_db, unique_id="eth", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="base",
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            chain="base",
+        )
+        partitions = _process_events(replay_db, chains=["base"])
+        assert {c for c, _w, _t in partitions} == {"base"}
+
+
+class TestOrderingMatters:
+    def test_fifo_consumes_the_older_lot_first(self, replay_db):
+        """The engine does not sort; the reader's order is what makes this right."""
+        _insert(replay_db, unique_id="a", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(replay_db, unique_id="b", block_timestamp=H1, block_number=2, log_index=0)
+        _insert(
+            replay_db,
+            unique_id="out",
+            block_timestamp=H2,
+            block_number=3,
+            log_index=0,
+            from_addr=WALLET,
+            to_addr=OTHER,
+        )
+        state = _process_events(replay_db)[_key(WALLET)]
+        # The $10 lot went first, leaving the $12 one.
+        assert state.engine.avg_cost_basis_usd() == pytest.approx(12.0)
+
+    def test_replay_is_deterministic(self, replay_db):
+        _insert(replay_db, unique_id="a", block_timestamp=H0, block_number=1, log_index=0)
+        _insert(replay_db, unique_id="b", block_timestamp=H1, block_number=2, log_index=0)
+        first = _process_events(replay_db)[_key(WALLET)].engine.avg_cost_basis_usd()
+        second = _process_events(replay_db)[_key(WALLET)].engine.avg_cost_basis_usd()
+        assert first == second
+
+
+class TestEmptyAndEdgeCases:
+    def test_empty_cache_yields_no_partitions(self, replay_db):
+        assert _process_events(replay_db) == {}
+
+    def test_token_outside_the_v1_registry_is_trading(self, replay_db):
+        """_token_symbol_for returns a sentinel that matches no registry entry."""
+        unknown = "0x" + "7" * 40
+        _insert_price(replay_db, ts=H0, price_usd=1.0, token_address=unknown)
+        _insert(
+            replay_db,
+            unique_id="in",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            token_address=unknown,
+        )
+        state = _process_events(replay_db)[_key(WALLET, unknown)]
+        assert state.engine.balance_token_by_source()["trading"] == Decimal(WEI)
+
+    def test_decimals_conflict_warns_and_keeps_the_first(self, replay_db, caplog):
+        """Two rows reporting different decimals for one token: one set is misscaled."""
+        _insert(
+            replay_db,
+            unique_id="a",
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            token_decimals=18,
+        )
+        _insert(
+            replay_db,
+            unique_id="b",
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            token_decimals=6,
+        )
+        with caplog.at_level(logging.WARNING):
+            state = _process_events(replay_db)[_key(WALLET)]
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "token_decimals conflict" in combined
+        assert state.engine.token_decimals == 18
+
+    def test_logs_the_partition_summary(self, replay_db, caplog):
+        _insert(replay_db, unique_id="in", block_timestamp=H0, block_number=1, log_index=0)
+        with caplog.at_level(logging.INFO):
+            _process_events(replay_db)
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Replayed into 2 partition(s)" in combined
