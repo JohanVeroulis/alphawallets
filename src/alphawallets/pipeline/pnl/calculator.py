@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -29,7 +29,9 @@ from duckdb import DuckDBPyConnection
 
 from alphawallets.config import Chain
 from alphawallets.fetchers.erc20.models import ERC20Transfer
+from alphawallets.fetchers.uniswap_v3.models import UniswapV3Swap
 from alphawallets.pipeline.pnl.cost_basis import FIFOEngine, InsufficientBalanceError
+from alphawallets.pipeline.pnl.known_pools import get_pool_tokens
 from alphawallets.pipeline.pnl.models import Realization, WalletPnL
 from alphawallets.pipeline.pnl.transfer_treatment import (
     TransferTreatment,
@@ -883,3 +885,193 @@ def _emit_pnl_rows(
             has_smart_wallet_signal=False,
             computed_at=computed_at,
         )
+
+
+# ---------- Swap event source (ADR 0015) ----------
+
+
+# Deterministic chronological order for swaps. Same discipline as
+# TRANSFER_ORDER_BY, one clause shorter: uniswap_v3_swap.log_index is NOT NULL,
+# because AW_01 decodes from eth_getLogs where the index is always present —
+# unlike AW_02's Transfers API rows, which carry None (ADR 0007). So no
+# NULLS LAST is needed, and log_index alone separates events within a block.
+#
+# tx_hash is the final tiebreak, making the order total: (chain, tx_hash,
+# log_index) is this table's uniqueness, so no two rows can tie on all four
+# clauses and two runs over the same cache produce identical order. Without it a
+# block holding two swaps at the same log index — impossible on chain, but the
+# schema permits it across pools — would come back in scan order.
+SWAP_ORDER_BY = "block_timestamp, block_number, log_index, tx_hash"
+
+_SWAP_COLUMNS = (
+    "chain, block_number, block_timestamp, tx_hash, log_index, pool_address, "
+    "tx_from, sender, recipient, amount0, amount1, sqrt_price_x96, liquidity, tick"
+)
+
+
+def _fetch_swap_events(
+    conn: DuckDBPyConnection,
+    chains: list[Chain] | None = None,
+    wallet_filter: list[str] | None = None,
+) -> Iterator[UniswapV3Swap]:
+    """Yield Uniswap V3 swaps in deterministic chronological order.
+
+    The second event source ADR 0015 adds. A swap row is self-sufficient — it
+    carries the trader EOA, the executed amounts, the pool and the executed
+    price — so pricing a trade needs no join to the transfer legs it emitted.
+
+    Args:
+        conn: Open DuckDB connection to the cache.
+        chains: Restrict to these chains. None reads every chain; [] reads
+            nothing, matching _fetch_transfer_events.
+        wallet_filter: Restrict to swaps submitted by these addresses, matched on
+            tx_from — the real EOA, not sender/recipient, which for a
+            router-mediated trade are the router and the pool (PR #15). None
+            reads every wallet; [] reads nothing.
+
+    Yields:
+        UniswapV3Swap models, oldest first.
+    """
+    predicates: list[str] = []
+    params: list[object] = []
+
+    if chains is not None:
+        if not chains:
+            logger.debug("chains=[] — no chains requested, returning no swaps")
+            return
+        placeholders = ", ".join("?" for _ in chains)
+        predicates.append(f"chain IN ({placeholders})")
+        params.extend(chains)
+
+    if wallet_filter is not None:
+        if not wallet_filter:
+            logger.debug("wallet_filter=[] — no wallets requested, returning no swaps")
+            return
+        wallets = [w.strip().lower() for w in wallet_filter]
+        placeholders = ", ".join("?" for _ in wallets)
+        predicates.append(f"lower(tx_from) IN ({placeholders})")
+        params.extend(wallets)
+
+    where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+    rows = conn.execute(
+        f"SELECT {_SWAP_COLUMNS} FROM uniswap_v3_swap {where} ORDER BY {SWAP_ORDER_BY}",
+        params,
+    ).fetchall()
+
+    per_chain: Counter[str] = Counter()
+    for row in rows:
+        per_chain[row[0]] += 1
+        yield UniswapV3Swap(
+            chain=row[0],
+            block_number=row[1],
+            block_timestamp=row[2],
+            tx_hash=row[3],
+            log_index=row[4],
+            pool_address=row[5],
+            tx_from=row[6],
+            sender=row[7],
+            recipient=row[8],
+            # Stored as VARCHAR because uint256 overflows HUGEINT; the model
+            # parses them back to int.
+            amount0=int(row[9]),
+            amount1=int(row[10]),
+            sqrt_price_x96=int(row[11]),
+            liquidity=int(row[12]),
+            tick=row[13],
+        )
+
+    logger.info(
+        "Read %d swap event(s) in chronological order; per chain %s",
+        sum(per_chain.values()),
+        dict(sorted(per_chain.items())),
+    )
+
+
+# ---------- Transfer-leg deduplication (ADR 0015) ----------
+
+
+DedupKey = tuple[str, str]
+"""(tx_hash, token_address) — the grain transfer legs can be excluded at.
+
+Not (tx_hash, token_address, log_index), because erc20_transfer.log_index is
+NULL for every row: Alchemy's Transfers API omits it for the ERC-20 category
+(ADR 0007), which is why that table's primary key is (chain, unique_id). ADR
+0015 records the consequence — the key is coarser than a log, so a transaction
+that both swaps and plainly transfers the same token loses the plain transfer
+too. Known, accepted, and tested.
+"""
+
+
+def _build_swap_dedup_set(swaps: Iterable[UniswapV3Swap]) -> set[DedupKey]:
+    """Collect the (tx_hash, token) pairs that swaps already account for.
+
+    A V3 swap emits two ERC-20 Transfer events, one per side, and AW_02 reads
+    both. Once swaps are an event source those legs must be excluded from the
+    transfer stream, or the same trade is counted twice — once at its executed
+    price and once at the hourly grid price it was wrong about (ADR 0015).
+
+    Both sides of the pool are added, not just the tracked token: a swap moves
+    both, and the leg we are not pricing is still a transfer AW_02 recorded.
+
+    Args:
+        swaps: Swap rows, in any order.
+
+    Returns:
+        A materialised set. The transfer stream tests every event against it, so
+        a generator would be consumed on the first lookup.
+
+    Raises:
+        KeyError: Via get_pool_tokens, if a swap's pool is not in the layout.
+            Guessing the pair would deduplicate the wrong transfers — dropping
+            real events, or keeping double-counted ones — so this fails loudly.
+    """
+    dedup: set[DedupKey] = set()
+    pools_seen: set[str] = set()
+
+    for swap in swaps:
+        token0, token1 = get_pool_tokens(swap.chain, swap.pool_address)
+        dedup.add((swap.tx_hash, token0))
+        dedup.add((swap.tx_hash, token1))
+        pools_seen.add(swap.pool_address)
+
+    logger.info(
+        "Dedup set: %d (tx_hash, token) pair(s) from swaps across %d pool(s)",
+        len(dedup),
+        len(pools_seen),
+    )
+    return dedup
+
+
+def _filter_transfers_by_dedup(
+    transfers: Iterable[ERC20Transfer],
+    dedup_set: set[DedupKey],
+) -> Iterator[ERC20Transfer]:
+    """Yield transfers that a swap row does not already account for.
+
+    Args:
+        transfers: The transfer event stream, in chronological order.
+        dedup_set: From _build_swap_dedup_set.
+
+    Yields:
+        Transfers whose (tx_hash, token_address) is not in the set, in the order
+        received — the engine's chronological contract survives the filter.
+    """
+    kept = 0
+    dropped = 0
+
+    for transfer in transfers:
+        if (transfer.tx_hash, transfer.token_address) in dedup_set:
+            dropped += 1
+            continue
+        kept += 1
+        yield transfer
+
+    total = kept + dropped
+    share = (100.0 * dropped / total) if total else 0.0
+    logger.info(
+        "Transfer dedup: %d kept, %d dropped as swap legs (%.1f%% of %d)",
+        kept,
+        dropped,
+        share,
+        total,
+    )

@@ -10,14 +10,20 @@ from alphawallets.db import connect
 from alphawallets.fetchers.erc20.models import ERC20Transfer
 from alphawallets.fetchers.erc20.writer import create_tables as create_erc20_tables
 from alphawallets.fetchers.prices.writer import create_tables as create_price_tables
+from alphawallets.fetchers.uniswap_v3.models import UniswapV3Swap
+from alphawallets.fetchers.uniswap_v3.writer import create_tables as create_swap_tables
 from alphawallets.pipeline.pnl import airdrop_registry
 from alphawallets.pipeline.pnl.airdrop_registry import (
     AirdropAttributionStatus,
     AirdropRecord,
 )
 from alphawallets.pipeline.pnl.calculator import (
+    SWAP_ORDER_BY,
     TRANSFER_ORDER_BY,
+    _build_swap_dedup_set,
+    _fetch_swap_events,
     _fetch_transfer_events,
+    _filter_transfers_by_dedup,
     _load_price_cache,
     _lookup_price,
     _process_events,
@@ -37,6 +43,11 @@ AAVE = "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9"
 
 T0 = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
 WEI = 10**18
+
+
+def _tx(n: int) -> str:
+    """A deterministic 32-byte tx hash from a small integer."""
+    return "0x" + f"{n:064x}"
 
 
 def _insert(
@@ -1953,3 +1964,454 @@ class TestReproducibility:
         first = [(r.wallet, r.window_start) for r in compute_wallet_pnl(replay_db, as_of=H2)]
         second = [(r.wallet, r.window_start) for r in compute_wallet_pnl(replay_db, as_of=H2)]
         assert first == second
+
+
+# ---------- Swap event source (ADR 0015) ----------
+
+
+USDC = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+WETH = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+LINK_WETH_BASE_POOL = "0x224a5d3f2155f2f85af70b6d72aea61a15273ff4"
+
+
+def _insert_swap(
+    conn,
+    *,
+    unique_tx: str,
+    block_timestamp: datetime,
+    block_number: int,
+    log_index: int,
+    pool: str = UNI_WETH_POOL,
+    tx_from: str = WALLET,
+    chain: str = "ethereum",
+    amount0: int = 500 * WEI,
+    amount1: int = -15 * 10**17,
+) -> None:
+    conn.execute(
+        "INSERT INTO uniswap_v3_swap VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            chain,
+            block_number,
+            block_timestamp,
+            unique_tx,
+            log_index,
+            pool,
+            tx_from,
+            "0x" + "f" * 40,
+            "0x" + "e" * 40,
+            str(amount0),
+            str(amount1),
+            "1522131675505538340261346218082348",
+            "3004629811743908228",
+            197275,
+        ],
+    )
+
+
+@pytest.fixture
+def swap_db():
+    """A cache with both event tables created."""
+    with connect(":memory:") as c:
+        create_swap_tables(c)
+        create_erc20_tables(c)
+        create_price_tables(c)
+        yield c
+
+
+class TestSwapReader:
+    def test_reads_rows_in_deterministic_order(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(3), block_timestamp=H2, block_number=3, log_index=0)
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=5)
+        _insert_swap(swap_db, unique_tx=_tx(2), block_timestamp=H0, block_number=1, log_index=1)
+        assert [s.tx_hash for s in _fetch_swap_events(swap_db)] == [_tx(2), _tx(1), _tx(3)]
+
+    def test_log_index_orders_within_a_block(self, swap_db):
+        """AW_01 decodes from eth_getLogs, so log_index is never NULL here —
+        unlike AW_02's rows (ADR 0007), which is why there is no NULLS LAST."""
+        for i, li in enumerate((9, 2, 7)):
+            _insert_swap(
+                swap_db, unique_tx=_tx(10 + i), block_timestamp=H0, block_number=1, log_index=li
+            )
+        assert [s.log_index for s in _fetch_swap_events(swap_db)] == [2, 7, 9]
+
+    def test_order_is_stable_across_reads(self, swap_db):
+        for i in range(4):
+            _insert_swap(swap_db, unique_tx=_tx(i), block_timestamp=H0, block_number=1, log_index=i)
+        first = [s.tx_hash for s in _fetch_swap_events(swap_db)]
+        assert first == [s.tx_hash for s in _fetch_swap_events(swap_db)]
+
+    def test_order_by_clause_names_its_four_columns(self):
+        for column in ("block_timestamp", "block_number", "log_index", "tx_hash"):
+            assert column in SWAP_ORDER_BY
+
+    def test_yields_models_with_signed_amounts(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        swap = next(iter(_fetch_swap_events(swap_db)))
+        assert isinstance(swap, UniswapV3Swap)
+        assert swap.amount0 == 500 * WEI
+        assert swap.amount1 == -15 * 10**17
+        assert swap.tx_from == WALLET
+
+    def test_wallet_filter_matches_tx_from(self, swap_db):
+        """tx_from is the real EOA; sender/recipient are the router and pool."""
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            tx_from=WALLET,
+        )
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(2),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            tx_from=OTHER,
+        )
+        got = [s.tx_hash for s in _fetch_swap_events(swap_db, wallet_filter=[WALLET])]
+        assert got == [_tx(1)]
+
+    def test_wallet_filter_is_case_insensitive(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        assert len(list(_fetch_swap_events(swap_db, wallet_filter=[WALLET.upper()]))) == 1
+
+    def test_empty_wallet_filter_reads_nothing(self, swap_db):
+        """[] means "none requested", distinct from None meaning "all"."""
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        assert list(_fetch_swap_events(swap_db, wallet_filter=[])) == []
+
+    def test_none_wallet_filter_reads_everything(self, swap_db):
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            tx_from=WALLET,
+        )
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(2),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            tx_from=OTHER,
+        )
+        assert len(list(_fetch_swap_events(swap_db))) == 2
+
+    def test_chain_filter(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(2),
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            chain="base",
+            pool=LINK_WETH_BASE_POOL,
+        )
+        got = [s.chain for s in _fetch_swap_events(swap_db, chains=["base"])]
+        assert got == ["base"]
+
+    def test_empty_chain_filter_reads_nothing(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        assert list(_fetch_swap_events(swap_db, chains=[])) == []
+
+    def test_filters_combine(self, swap_db):
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            tx_from=WALLET,
+        )
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(2),
+            block_timestamp=H0,
+            block_number=2,
+            log_index=0,
+            tx_from=WALLET,
+            chain="base",
+            pool=LINK_WETH_BASE_POOL,
+        )
+        got = [
+            s.tx_hash
+            for s in _fetch_swap_events(swap_db, chains=["ethereum"], wallet_filter=[WALLET])
+        ]
+        assert got == [_tx(1)]
+
+    def test_empty_table_yields_nothing(self, swap_db):
+        assert list(_fetch_swap_events(swap_db)) == []
+
+    def test_returns_a_generator(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        result = _fetch_swap_events(swap_db)
+        assert not isinstance(result, list)
+        assert next(iter(result)).tx_hash == _tx(1)
+
+
+class TestSwapDedup:
+    """ADR 0015: a swap's transfer legs must not be counted a second time."""
+
+    def test_set_contains_both_token_legs(self, swap_db):
+        """A swap moves both sides, and AW_02 recorded both transfers."""
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+        assert dedup == {(_tx(1), UNI), (_tx(1), WETH)}
+
+    def test_empty_swaps_give_an_empty_set(self, swap_db):
+        assert _build_swap_dedup_set(_fetch_swap_events(swap_db)) == set()
+
+    def test_several_swaps_accumulate(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        _insert_swap(swap_db, unique_tx=_tx(2), block_timestamp=H1, block_number=2, log_index=0)
+        assert len(_build_swap_dedup_set(_fetch_swap_events(swap_db))) == 4
+
+    def test_two_swaps_in_one_tx_collapse_to_the_same_keys(self, swap_db):
+        """Same tx, same pool, different log indices — the key is tx-level."""
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=1)
+        assert len(_build_swap_dedup_set(_fetch_swap_events(swap_db))) == 2
+
+    def test_base_pool_resolves_its_own_tokens(self, swap_db):
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            chain="base",
+            pool=LINK_WETH_BASE_POOL,
+        )
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+        base_weth = "0x4200000000000000000000000000000000000006"
+        base_link = "0x88fb150bdc53a65fe94dea0c9ba0a6daf8c6e196"
+        assert dedup == {(_tx(1), base_weth), (_tx(1), base_link)}
+
+    def test_unknown_pool_raises(self, swap_db):
+        """Guessing a pair would deduplicate the wrong transfers."""
+        _insert_swap(
+            swap_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            pool="0x" + "9" * 40,
+        )
+        with pytest.raises(KeyError, match="POOL_TOKEN_LAYOUT"):
+            _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+
+class TestTransferDedupFilter:
+    def test_matching_transfer_is_dropped(self, swap_db):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+        leg = ERC20Transfer(
+            chain="ethereum",
+            block_number=1,
+            block_timestamp=H0,
+            tx_hash=_tx(1),
+            log_index=None,
+            unique_id="leg",
+            token_address=UNI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+            value_raw=str(WEI),
+            token_decimals=18,
+        )
+        assert list(_filter_transfers_by_dedup([leg], dedup)) == []
+
+    def test_same_tx_different_token_is_kept(self, swap_db):
+        """An unrelated transfer in the same transaction survives.
+
+        The multicall shape: a swap moves UNI/WETH while the same tx also moves
+        USDC, which no swap accounts for.
+        """
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+        unrelated = ERC20Transfer(
+            chain="ethereum",
+            block_number=1,
+            block_timestamp=H0,
+            tx_hash=_tx(1),
+            log_index=None,
+            unique_id="usdc",
+            token_address=USDC,
+            from_addr=WALLET,
+            to_addr=OTHER,
+            value_raw="1000000",
+            token_decimals=6,
+        )
+        assert [t.unique_id for t in _filter_transfers_by_dedup([unrelated], dedup)] == ["usdc"]
+
+    def test_multicall_mixed_tx_keeps_only_the_non_swap_token(self, swap_db):
+        """One tx, three transfers: both swap legs plus a USDC fee payment."""
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+        def xfer(uid: str, token: str, decimals: int) -> ERC20Transfer:
+            return ERC20Transfer(
+                chain="ethereum",
+                block_number=1,
+                block_timestamp=H0,
+                tx_hash=_tx(1),
+                log_index=None,
+                unique_id=uid,
+                token_address=token,
+                from_addr=WALLET,
+                to_addr=OTHER,
+                value_raw="1000",
+                token_decimals=decimals,
+            )
+
+        stream = [xfer("uni_leg", UNI, 18), xfer("weth_leg", WETH, 18), xfer("fee", USDC, 6)]
+        kept = [t.unique_id for t in _filter_transfers_by_dedup(stream, dedup)]
+        assert kept == ["fee"]
+
+    def test_same_token_plain_transfer_in_a_swap_tx_is_also_dropped(self, swap_db):
+        """The known, accepted limitation ADR 0015 requires a test for.
+
+        The dedup key is (tx_hash, token_address), not per-log, because
+        erc20_transfer.log_index is NULL for every row (ADR 0007). So a
+        multicall transaction that both swaps UNI and plainly transfers UNI
+        loses the plain transfer too. Asserting the behaviour rather than
+        discovering it later.
+        """
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+        plain = ERC20Transfer(
+            chain="ethereum",
+            block_number=1,
+            block_timestamp=H0,
+            tx_hash=_tx(1),
+            log_index=None,
+            unique_id="plain_uni",
+            token_address=UNI,
+            from_addr=WALLET,
+            to_addr=THIRD,
+            value_raw=str(WEI),
+            token_decimals=18,
+        )
+        assert list(_filter_transfers_by_dedup([plain], dedup)) == []
+
+    def test_different_tx_same_token_is_kept(self, swap_db):
+        """The key is per transaction, so an unrelated later transfer survives."""
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+        later = ERC20Transfer(
+            chain="ethereum",
+            block_number=2,
+            block_timestamp=H1,
+            tx_hash=_tx(2),
+            log_index=None,
+            unique_id="later",
+            token_address=UNI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+            value_raw=str(WEI),
+            token_decimals=18,
+        )
+        assert [t.unique_id for t in _filter_transfers_by_dedup([later], dedup)] == ["later"]
+
+    def test_empty_dedup_set_is_a_no_op(self, swap_db):
+        """A swap whose legs never appear as transfers leaves the stream intact."""
+        transfers = [
+            ERC20Transfer(
+                chain="ethereum",
+                block_number=i,
+                block_timestamp=H0,
+                tx_hash=_tx(100 + i),
+                log_index=None,
+                unique_id=f"t{i}",
+                token_address=UNI,
+                from_addr=OTHER,
+                to_addr=WALLET,
+                value_raw=str(WEI),
+                token_decimals=18,
+            )
+            for i in range(3)
+        ]
+        kept = list(_filter_transfers_by_dedup(transfers, set()))
+        assert len(kept) == len(transfers)
+
+    def test_swap_with_no_matching_transfers_filters_nothing(self, swap_db):
+        """Dedup set populated, but no transfer matches — kept == input."""
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+        assert dedup
+
+        transfers = [
+            ERC20Transfer(
+                chain="ethereum",
+                block_number=2,
+                block_timestamp=H1,
+                tx_hash=_tx(50),
+                log_index=None,
+                unique_id="unrelated",
+                token_address=AAVE,
+                from_addr=OTHER,
+                to_addr=WALLET,
+                value_raw=str(WEI),
+                token_decimals=18,
+            )
+        ]
+        assert len(list(_filter_transfers_by_dedup(transfers, dedup))) == 1
+
+    def test_order_is_preserved(self, swap_db):
+        """The engine's chronological contract has to survive the filter."""
+        transfers = [
+            ERC20Transfer(
+                chain="ethereum",
+                block_number=i,
+                block_timestamp=H0 + timedelta(minutes=i),
+                tx_hash=_tx(200 + i),
+                log_index=None,
+                unique_id=f"o{i}",
+                token_address=UNI,
+                from_addr=OTHER,
+                to_addr=WALLET,
+                value_raw=str(WEI),
+                token_decimals=18,
+            )
+            for i in range(5)
+        ]
+        kept = [t.unique_id for t in _filter_transfers_by_dedup(transfers, set())]
+        assert kept == [f"o{i}" for i in range(5)]
+
+    def test_logs_kept_dropped_and_share(self, swap_db, caplog):
+        _insert_swap(swap_db, unique_tx=_tx(1), block_timestamp=H0, block_number=1, log_index=0)
+        dedup = _build_swap_dedup_set(_fetch_swap_events(swap_db))
+
+        def xfer(uid: str, token: str) -> ERC20Transfer:
+            return ERC20Transfer(
+                chain="ethereum",
+                block_number=1,
+                block_timestamp=H0,
+                tx_hash=_tx(1),
+                log_index=None,
+                unique_id=uid,
+                token_address=token,
+                from_addr=WALLET,
+                to_addr=OTHER,
+                value_raw="1000",
+                token_decimals=18,
+            )
+
+        with caplog.at_level(logging.INFO):
+            list(_filter_transfers_by_dedup([xfer("a", UNI), xfer("b", AAVE)], dedup))
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "1 kept, 1 dropped" in combined
+        assert "50.0%" in combined
+
+    def test_returns_a_generator(self, swap_db):
+        result = _filter_transfers_by_dedup([], set())
+        assert not isinstance(result, list)
+        assert list(result) == []
