@@ -767,7 +767,17 @@ def _resolve_as_of(
     conn: DuckDBPyConnection,
     chains: list[Chain] | None = None,
 ) -> datetime | None:
-    """Return the newest indexed block timestamp, or None when there is none.
+    """Return an as_of that includes every indexed event, or None when empty.
+
+    The newest block timestamp plus one microsecond, not the timestamp itself.
+    window_end is exclusive, so defaulting to MAX(block_timestamp) exactly would
+    exclude every event in the newest block — and for a cache whose events all
+    share one timestamp it would exclude everything and report no activity at
+    all. "As of the data edge" has to mean "including the edge", so the bound
+    sits just past it.
+
+    An explicitly passed as_of keeps strict exclusive semantics: a caller naming
+    an instant means up to but not including it.
 
     Scoped to the same chains the run covers, so a Base-only run is not pinned
     to Ethereum's head.
@@ -786,7 +796,7 @@ def _resolve_as_of(
     ).fetchone()
     if row is None or row[0] is None:
         return None
-    return row[0].astimezone(UTC)
+    return row[0].astimezone(UTC) + timedelta(microseconds=1)
 
 
 def _emit_pnl_rows(

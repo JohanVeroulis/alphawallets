@@ -135,6 +135,11 @@ uv run python -m alphawallets.fetchers.prices.aw_03_defillama_historical_prices 
 
 # Prove the three schemas join: one wallet's priced UNI timeline (auto-picks a wallet)
 uv run python -m alphawallets.pipeline.exploration.wallet_activity_proof
+
+# Compute realized PnL into wallet_pnl (reads the cache only; --dry-run to preview)
+uv run python -m alphawallets.pipeline.pnl
+uv run python -m alphawallets.pipeline.pnl --dry-run
+uv run python -m alphawallets.pipeline.pnl --wallet 0xABC... --chains ethereum
 ```
 
 **Note on dependencies:** `pyproject.toml` declares `duckdb`, `pandas`, `python-dotenv`, `httpx`, `web3` (pinned to 7.x per [ADR 0005](docs/decisions/0005-web3-7x-pin.md)), `eth-abi` (5.x), and `pydantic` (2.x). Dev dependencies: `ruff`, `pytest`, `pytest-cov`, `ipykernel`.
