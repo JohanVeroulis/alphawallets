@@ -1,10 +1,9 @@
 """PnL calculator orchestrator (ADR 0012 step 4).
 
 This module will eventually drive the whole PnL computation: read events, resolve
-prices, classify transfers, feed the FIFO engine, emit WalletPnL rows. **So far
-it reads events, resolves prices, replays them through the classifier and the
-engine, and books realizations for pool-destination sales** — no WalletPnL
-emission and no window slicing yet.
+prices, classify transfers, feed the FIFO engine, emit WalletPnL rows — and
+`compute_wallet_pnl` now does all of it, end to end, returning rows ready for a
+writer.
 
 Reading is a step worth isolating because of one hard constraint the engine
 imposes. `FIFOEngine` does not sort: it trusts that events arrive in the order
@@ -23,7 +22,7 @@ import logging
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from duckdb import DuckDBPyConnection
@@ -31,7 +30,7 @@ from duckdb import DuckDBPyConnection
 from alphawallets.config import Chain
 from alphawallets.fetchers.erc20.models import ERC20Transfer
 from alphawallets.pipeline.pnl.cost_basis import FIFOEngine, InsufficientBalanceError
-from alphawallets.pipeline.pnl.models import Realization
+from alphawallets.pipeline.pnl.models import Realization, WalletPnL
 from alphawallets.pipeline.pnl.transfer_treatment import (
     TransferTreatment,
     classify_transfer,
@@ -375,6 +374,25 @@ to per-wallet at report time.
 """
 
 
+@dataclass(frozen=True)
+class LotEvent:
+    """One acquisition as it was applied, kept so windows can be sliced later.
+
+    bought_usd is a per-window figure, and the engine's lots cannot answer it:
+    a lot that has been fully consumed is gone from the stack, and a partial one
+    no longer carries the quantity originally acquired. Recording the event as it
+    happens is both cheaper and more honest than reconstructing it.
+
+    unit_cost_usd is None when the acquisition could not be priced. The event is
+    still recorded — it is why the partition is flagged, and dropping it would
+    lose the timestamp the per-window flag needs.
+    """
+
+    occurred_at: datetime
+    unit_cost_usd: float | None
+    qty_token: Decimal
+
+
 @dataclass
 class PartitionState:
     """One (chain, wallet, token) partition's engine plus what went wrong in it.
@@ -396,6 +414,17 @@ class PartitionState:
     insufficient_balance_count: int = 0
     event_count: int = 0
 
+    in_events: list[LotEvent] = field(default_factory=list)
+    """Every acquisition applied to this partition, in chronological order.
+
+    Feeds bought_usd per window, and its timestamps make has_unpriceable_events
+    a per-window answer rather than a partition-wide approximation."""
+
+    first_event_at: datetime | None = None
+    """Earliest event seen. An event before a window's start means the wallet
+    already held a position when the window opened, which is ADR 0012 decision
+    5's has_pre_window_activity."""
+
     realizations: list[Realization] = field(default_factory=list)
     """Realizations the wallet actually booked, in consumption order.
 
@@ -413,6 +442,7 @@ def _process_events(
     conn: DuckDBPyConnection,
     chains: list[Chain] | None = None,
     wallet_filter: list[str] | None = None,
+    as_of: datetime | None = None,
 ) -> dict[PartitionKey, PartitionState]:
     """Replay every transfer through the classifier and the FIFO engine.
 
@@ -428,6 +458,11 @@ def _process_events(
             at wallet selection rather than in SQL — pushing it into the query is
             a later optimisation, and doing it here keeps one definition of which
             wallets a transfer touches.
+        as_of: Stop replaying at this instant, exclusive. None replays
+            everything. Events after it are not applied at all, rather than
+            applied and filtered later: the engine's state is a running cost
+            basis, so letting a future event into the stack would change the
+            lots an in-window sale consumes.
 
     Returns:
         Every partition the replay created, keyed by (chain, wallet, token).
@@ -446,6 +481,12 @@ def _process_events(
     decimals_conflicts = 0
 
     for transfer in _fetch_transfer_events(conn, chains=chains):
+        if as_of is not None and transfer.block_timestamp >= as_of:
+            # Events are chronologically ordered, so the first one at or past
+            # the cutoff means every remaining one is too. window_end is
+            # exclusive (WalletPnL), so the boundary instant itself is excluded.
+            break
+
         # A set, not a pair: a self-transfer has from_addr == to_addr, and
         # processing it once per side would apply it twice to the same partition
         # — adding the lot, then adding it again. classify_transfer returns
@@ -515,6 +556,11 @@ def _process_events(
                 )
 
             state.event_count += 1
+            if state.first_event_at is None:
+                # Events arrive chronologically (PR #35), so the first one seen
+                # is the earliest — no min() needed, and relying on the order
+                # keeps the reader's contract load-bearing rather than decorative.
+                state.first_event_at = transfer.block_timestamp
             qty = Decimal(transfer.value_raw)
 
             if classification.treatment in _OUTGOING_TREATMENTS:
@@ -588,6 +634,15 @@ def _process_events(
                 # MKR's 4-hour grid guarantees this path runs on live data.
                 state.has_unpriceable_events = True
                 state.unpriced_event_count += 1
+                # Recorded despite creating no lot: the timestamp is what makes
+                # the per-window flag precise instead of partition-wide.
+                state.in_events.append(
+                    LotEvent(
+                        occurred_at=transfer.block_timestamp,
+                        unit_cost_usd=None,
+                        qty_token=qty,
+                    )
+                )
                 logger.debug(
                     "No price for %s at %s; lot skipped and partition flagged",
                     transfer.token_address,
@@ -601,6 +656,13 @@ def _process_events(
                 qty_token=qty,
                 unit_cost_usd=classification.unit_cost_usd,
                 source=classification.source,
+            )
+            state.in_events.append(
+                LotEvent(
+                    occurred_at=transfer.block_timestamp,
+                    unit_cost_usd=classification.unit_cost_usd,
+                    qty_token=qty,
+                )
             )
 
     if ignored_count:
@@ -635,3 +697,179 @@ def _token_symbol_for(chain: str, token_address: str) -> str:
         if addresses.get(chain) == token_address.lower():
             return symbol
     return "__UNKNOWN__"
+
+
+# ---------- Window emission ----------
+
+
+WINDOW_DAYS: tuple[int, ...] = (30, 90)
+"""The PnL windows V1 reports.
+
+ADR 0012 decision 9: both windows share one engine state and differ only in
+which Realizations they count. The cost basis is *not* reset at a window
+boundary — a wallet that bought 60 days ago and sold 20 days ago shows the real
+$10 cost in its 30-day row, not a zero cost that books the whole sale as profit.
+"""
+
+
+def compute_wallet_pnl(
+    conn: DuckDBPyConnection,
+    *,
+    as_of: datetime | None = None,
+    wallet_filter: list[str] | None = None,
+    chains: list[Chain] | None = None,
+) -> Iterator[WalletPnL]:
+    """Compute per-(wallet, token, window) PnL rows from the cache.
+
+    The end-to-end orchestrator: reads events, resolves prices, replays them
+    through the classifier and the FIFO engine, then slices the resulting
+    realizations into windows.
+
+    Args:
+        conn: Open DuckDB connection to the cache.
+        as_of: The instant every window ends at, exclusive. Defaults to the
+            newest block_timestamp in erc20_transfer — the edge of what we
+            actually know, rather than wall-clock now, which would open a
+            trailing gap between the last indexed block and the window end and
+            make the result depend on when it was run.
+        wallet_filter: Only compute these wallets, any case.
+        chains: Restrict to these chains. None means every chain; [] means none.
+
+    Yields:
+        One WalletPnL per (partition, window) that had activity in that window.
+        Nothing at all when the cache holds no transfers.
+
+    Notes:
+        A generator. The writer consumes incrementally, and a universe-wide run
+        produces two rows per (wallet, token) pair — materialising them all
+        before the first write buys nothing.
+    """
+    if as_of is None:
+        resolved = _resolve_as_of(conn, chains=chains)
+        if resolved is None:
+            logger.info("No transfers in the cache; no PnL to compute")
+            return
+        as_of = resolved
+        logger.info("as_of defaulted to the newest indexed block: %s", as_of.isoformat())
+
+    partitions = _process_events(conn, chains=chains, wallet_filter=wallet_filter, as_of=as_of)
+
+    emitted = 0
+    for key, state in sorted(partitions.items()):
+        for row in _emit_pnl_rows(key, state, as_of):
+            emitted += 1
+            yield row
+
+    logger.info("Emitted %d WalletPnL row(s) from %d partition(s)", emitted, len(partitions))
+
+
+def _resolve_as_of(
+    conn: DuckDBPyConnection,
+    chains: list[Chain] | None = None,
+) -> datetime | None:
+    """Return the newest indexed block timestamp, or None when there is none.
+
+    Scoped to the same chains the run covers, so a Base-only run is not pinned
+    to Ethereum's head.
+    """
+    if chains is not None and not chains:
+        return None
+
+    where, params = "", []
+    if chains is not None:
+        placeholders = ", ".join("?" for _ in chains)
+        where = f"WHERE chain IN ({placeholders})"
+        params = list(chains)
+
+    row = conn.execute(
+        f"SELECT MAX(block_timestamp) FROM erc20_transfer {where}", params
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return row[0].astimezone(UTC)
+
+
+def _emit_pnl_rows(
+    key: PartitionKey,
+    state: PartitionState,
+    as_of: datetime,
+) -> Iterator[WalletPnL]:
+    """Slice one partition's history into a row per window.
+
+    Args:
+        key: (chain, wallet, token_address).
+        state: The replayed partition.
+        as_of: Window end, shared by every window and exclusive.
+
+    Yields:
+        One WalletPnL per window with activity. A window with neither a
+        realization nor an acquisition is skipped rather than emitted as a row
+        of zeroes — an all-zero row and "this wallet did nothing here" are the
+        same fact, and writing it would pad the table and the leaderboard with
+        rows carrying no information.
+    """
+    chain, wallet, token_address = key
+    divisor = Decimal(10) ** state.engine.token_decimals
+    computed_at = datetime.now(tz=UTC)
+
+    # Balance state is identical across windows: every window ends at as_of, so
+    # the engine's final state *is* the state at window_end. Computed once.
+    balance = state.engine.balance_token()
+    avg_cost = state.engine.avg_cost_basis_usd()
+
+    for days in WINDOW_DAYS:
+        window_start = as_of - timedelta(days=days)
+
+        realizations = [r for r in state.realizations if window_start <= r.realized_at < as_of]
+        acquisitions = [e for e in state.in_events if window_start <= e.occurred_at < as_of]
+
+        if not realizations and not acquisitions:
+            continue
+
+        trading = sum(r.pnl_usd for r in realizations if r.source == "trading")
+        airdrop = sum(r.pnl_usd for r in realizations if r.source == "airdrop")
+        sold = sum(Decimal(str(r.unit_sale_usd)) * (r.qty_token / divisor) for r in realizations)
+        bought = sum(
+            Decimal(str(e.unit_cost_usd)) * (e.qty_token / divisor)
+            for e in acquisitions
+            if e.unit_cost_usd is not None
+        )
+
+        # Per-window rather than partition-wide: an unpriced event three months
+        # before a 30-day window says nothing about that window's completeness,
+        # and flagging it anyway would make the caveat useless by making it
+        # almost always true.
+        unpriced_in_window = any(e.unit_cost_usd is None for e in acquisitions)
+
+        # Two independent signals for the same condition. An event earlier than
+        # the window means the wallet already held a position when it opened.
+        # An insufficient balance means it sent tokens the stack never received,
+        # which can only happen if it acquired them before our data starts —
+        # so it is evidence of pre-window activity even when every visible event
+        # falls inside the window.
+        earlier_event = state.first_event_at is not None and state.first_event_at < window_start
+        has_pre_window = earlier_event or state.has_insufficient_balance
+
+        yield WalletPnL(
+            chain=chain,
+            wallet=wallet,
+            token_address=token_address,
+            window_start=window_start,
+            window_end=as_of,
+            realized_pnl_usd=float(trading + airdrop),
+            realized_pnl_trading_usd=float(trading),
+            realized_pnl_airdrop_usd=float(airdrop),
+            # V1 ships realized PnL only; the column is reserved (ADR 0012).
+            unrealized_pnl_usd=None,
+            bought_usd=float(bought),
+            sold_usd=float(sold),
+            realization_count=len(realizations),
+            balance_token=balance,
+            avg_cost_basis_usd=avg_cost,
+            has_pre_window_activity=has_pre_window,
+            has_unpriceable_events=unpriced_in_window,
+            # Decision 7: detection logic is V1.5+. False rather than None so
+            # the column is honest about what V1 checked, which is nothing.
+            has_smart_wallet_signal=False,
+            computed_at=computed_at,
+        )
