@@ -1,9 +1,9 @@
 """PnL calculator orchestrator (ADR 0012 step 4).
 
 This module will eventually drive the whole PnL computation: read events, resolve
-prices, classify transfers, feed the FIFO engine, emit WalletPnL rows. **This PR
-contains only the data-reading skeleton** — no FIFO logic, no price lookup, no
-WalletPnL emission.
+prices, classify transfers, feed the FIFO engine, emit WalletPnL rows. **So far
+it contains the data-reading and price layers only** — no FIFO logic, no
+classification, no WalletPnL emission.
 
 Reading is a step worth isolating because of one hard constraint the engine
 imposes. `FIFOEngine` does not sort: it trusts that events arrive in the order
@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Iterator
+from datetime import UTC, datetime
 
 from duckdb import DuckDBPyConnection
 
@@ -184,3 +185,154 @@ def _fetch_transfer_events(
             len(skipped),
         )
     logger.info("Read %d transfer event(s) in chronological order", yielded)
+
+
+# ---------- Price layer ----------
+
+
+# Which provider wins when more than one has a price for the same hour.
+#
+# token_price's primary key is (chain, token_address, ts, source), so two
+# providers can legitimately hold a row for one hour — that is exactly what the
+# four-column key reserves space for (ADR 0008 keeps CoinGecko in reserve, and
+# ADR 0010 kept `source` meaning *provider* rather than *route* for this reason).
+#
+# A dict keyed on (chain, token, hour) therefore has to choose, and choosing by
+# scan order would make the PnL depend on DuckDB's row order. Preference is
+# explicit and lowest-index-wins; an unlisted source sorts after every listed
+# one, so adding a provider without updating this list degrades to "deprioritised"
+# rather than to "undefined".
+_SOURCE_PREFERENCE: tuple[str, ...] = ("defillama",)
+
+PriceCacheKey = tuple[str, str, datetime]
+
+
+def _hour_utc(ts: datetime) -> datetime:
+    """Truncate a timestamp to its UTC hour — the price grid's join key.
+
+    Done in Python rather than SQL so the key built at load time and the key
+    built at lookup time come from the same code path. Deliberately a local
+    helper rather than an import from pipeline/exploration: a few lines of
+    duplication is cheaper than coupling two sibling pipeline packages, and this
+    is the kind of function that must not change under one caller without the
+    other noticing.
+    """
+    return ts.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def _load_price_cache(
+    conn: DuckDBPyConnection,
+    chains: list[Chain] | None = None,
+    tokens: list[str] | None = None,
+) -> dict[PriceCacheKey, float]:
+    """Load hourly prices into a dict for in-memory lookup.
+
+    One query instead of one per event. The PnL calculator prices every
+    acquisition and every realization, so a per-event query would be tens of
+    thousands of round trips against a table small enough to hold in memory —
+    the current cache holds 2,893 price rows.
+
+    Args:
+        conn: Open DuckDB connection to the cache.
+        chains: Restrict to these chains. None loads every chain; [] loads
+            nothing, matching _fetch_transfer_events' semantics.
+        tokens: Restrict to these token addresses, any case. None loads every
+            token; [] loads nothing.
+
+    Returns:
+        A mapping from (chain, token_address, hour) to price_usd, with the hour
+        truncated to UTC. Hours with no price are simply absent — the lookup
+        treats an absent key as "no price", which is the distinction ADR 0009's
+        classification depends on.
+    """
+    predicates: list[str] = []
+    params: list[object] = []
+
+    if chains is not None:
+        if not chains:
+            logger.debug("chains=[] — no chains requested, price cache is empty")
+            return {}
+        placeholders = ", ".join("?" for _ in chains)
+        predicates.append(f"chain IN ({placeholders})")
+        params.extend(chains)
+
+    if tokens is not None:
+        if not tokens:
+            logger.debug("tokens=[] — no tokens requested, price cache is empty")
+            return {}
+        lowered = [t.strip().lower() for t in tokens]
+        placeholders = ", ".join("?" for _ in lowered)
+        predicates.append(f"lower(token_address) IN ({placeholders})")
+        params.extend(lowered)
+
+    where = f"WHERE {' AND '.join(predicates)}" if predicates else ""
+    rows = conn.execute(
+        f"SELECT chain, token_address, ts, price_usd, source FROM token_price {where}",
+        params,
+    ).fetchall()
+
+    cache: dict[PriceCacheKey, float] = {}
+    chosen_source: dict[PriceCacheKey, str] = {}
+    multi_source_keys = 0
+
+    for chain, token_address, ts, price_usd, source in rows:
+        key = (chain, token_address.lower(), _hour_utc(ts))
+        incumbent = chosen_source.get(key)
+        if incumbent is None:
+            cache[key] = float(price_usd)
+            chosen_source[key] = source
+            continue
+
+        multi_source_keys += 1
+        if _source_rank(source) < _source_rank(incumbent):
+            cache[key] = float(price_usd)
+            chosen_source[key] = source
+
+    if multi_source_keys:
+        logger.info(
+            "%d price hour(s) had more than one source; resolved by preference %s",
+            multi_source_keys,
+            list(_SOURCE_PREFERENCE),
+        )
+
+    pairs = {(chain, token) for chain, token, _hour in cache}
+    logger.info(
+        "Loaded %d price hour(s) across %d (chain, token) pair(s)",
+        len(cache),
+        len(pairs),
+    )
+    return cache
+
+
+def _source_rank(source: str) -> int:
+    """Preference index of a price source; unlisted sources sort last."""
+    try:
+        return _SOURCE_PREFERENCE.index(source)
+    except ValueError:
+        return len(_SOURCE_PREFERENCE)
+
+
+def _lookup_price(
+    cache: dict[PriceCacheKey, float],
+    chain: str,
+    token_address: str,
+    event_ts: datetime,
+) -> float | None:
+    """Return the USD price for an event's hour, or None when there is none.
+
+    None is a real answer, not an error. ADR 0012 decision 6 keeps an unpriced
+    event in the output and flags the row, rather than dropping it or inventing
+    a price — and MKR's 4-hour provider grid (PR #31, proposed as ADR 0013)
+    guarantees this path is exercised on live data rather than only in theory.
+
+    Args:
+        cache: The mapping from _load_price_cache.
+        chain: Chain name.
+        token_address: Token contract, any case.
+        event_ts: The event's timestamp. Truncated to its UTC hour here, by the
+            same helper that built the keys.
+
+    Returns:
+        The price, or None when that hour has no row.
+    """
+    return cache.get((chain, token_address.lower(), _hour_utc(event_ts)))
