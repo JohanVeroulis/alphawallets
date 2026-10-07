@@ -8,9 +8,12 @@ import pytest
 from alphawallets.db import connect
 from alphawallets.fetchers.erc20.models import ERC20Transfer
 from alphawallets.fetchers.erc20.writer import create_tables as create_erc20_tables
+from alphawallets.fetchers.prices.writer import create_tables as create_price_tables
 from alphawallets.pipeline.pnl.calculator import (
     TRANSFER_ORDER_BY,
     _fetch_transfer_events,
+    _load_price_cache,
+    _lookup_price,
 )
 
 WALLET = "0x" + "1" * 40
@@ -412,3 +415,216 @@ class TestShape:
         _insert(cache, unique_id="ok", block_timestamp=T0, block_number=1, log_index=0)
         event = next(iter(_fetch_transfer_events(cache)))
         assert event.block_timestamp.utcoffset().total_seconds() == 0
+
+
+# ---------- Price layer ----------
+
+
+H0 = datetime(2026, 10, 1, 0, 0, tzinfo=UTC)
+H1 = datetime(2026, 10, 1, 1, 0, tzinfo=UTC)
+H2 = datetime(2026, 10, 1, 2, 0, tzinfo=UTC)
+
+
+def _insert_price(
+    conn,
+    *,
+    ts: datetime,
+    price_usd: float,
+    chain: str = "ethereum",
+    token_address: str = UNI,
+    source: str = "defillama",
+) -> None:
+    conn.execute(
+        "INSERT INTO token_price VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [chain, token_address, ts, price_usd, 0.99, source, "chart", H0],
+    )
+
+
+@pytest.fixture
+def price_cache_db():
+    """Eight price rows: two tokens on Ethereum, one on Base, across three hours."""
+    with connect(":memory:") as c:
+        create_price_tables(c)
+        _insert_price(c, ts=H0, price_usd=8.80, token_address=UNI)
+        _insert_price(c, ts=H1, price_usd=8.85, token_address=UNI)
+        _insert_price(c, ts=H2, price_usd=8.90, token_address=UNI)
+        _insert_price(c, ts=H0, price_usd=179.40, token_address=AAVE)
+        _insert_price(c, ts=H1, price_usd=179.50, token_address=AAVE)
+        _insert_price(c, ts=H0, price_usd=8.81, token_address=UNI, chain="base")
+        _insert_price(c, ts=H1, price_usd=8.86, token_address=UNI, chain="base")
+        _insert_price(c, ts=H2, price_usd=179.60, token_address=AAVE)
+        yield c
+
+
+class TestLoadPriceCache:
+    def test_key_shape_and_values(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        assert cache[("ethereum", UNI, H0)] == 8.80
+        assert cache[("ethereum", AAVE, H1)] == 179.50
+        assert cache[("base", UNI, H0)] == 8.81
+
+    def test_loads_every_row_when_unfiltered(self, price_cache_db):
+        assert len(_load_price_cache(price_cache_db)) == 8
+
+    def test_keys_are_hour_truncated_utc(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        for _chain, _token, hour in cache:
+            assert hour.utcoffset().total_seconds() == 0
+            assert (hour.minute, hour.second, hour.microsecond) == (0, 0, 0)
+
+    def test_token_addresses_are_lowercase_in_keys(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        for _chain, token, _hour in cache:
+            assert token == token.lower()
+
+    def test_chain_filter(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db, chains=["base"])
+        assert {c for c, _t, _h in cache} == {"base"}
+        assert len(cache) == 2
+
+    def test_token_filter(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db, tokens=[AAVE])
+        assert {t for _c, t, _h in cache} == {AAVE}
+        assert len(cache) == 3
+
+    def test_token_filter_is_case_insensitive(self, price_cache_db):
+        """A checksummed address must not quietly load an empty cache."""
+        cache = _load_price_cache(price_cache_db, tokens=[AAVE.upper()])
+        assert len(cache) == 3
+
+    def test_filters_combine(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db, chains=["ethereum"], tokens=[UNI])
+        assert set(cache) == {
+            ("ethereum", UNI, H0),
+            ("ethereum", UNI, H1),
+            ("ethereum", UNI, H2),
+        }
+
+    def test_empty_chain_list_loads_nothing(self, price_cache_db):
+        """[] means "none requested" — same semantics as the event reader."""
+        assert _load_price_cache(price_cache_db, chains=[]) == {}
+
+    def test_empty_token_list_loads_nothing(self, price_cache_db):
+        assert _load_price_cache(price_cache_db, tokens=[]) == {}
+
+    def test_empty_table_gives_an_empty_cache(self):
+        with connect(":memory:") as c:
+            create_price_tables(c)
+            assert _load_price_cache(c) == {}
+
+    def test_logs_size_and_pair_count(self, price_cache_db, caplog):
+        with caplog.at_level(logging.INFO):
+            _load_price_cache(price_cache_db)
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "Loaded 8 price hour(s)" in combined
+        assert "3 (chain, token) pair(s)" in combined
+
+
+class TestMultiSourceResolution:
+    """token_price's PK includes source, so two providers can hold one hour.
+
+    A dict keyed on (chain, token, hour) must choose, and choosing by scan order
+    would make PnL depend on DuckDB's row order.
+    """
+
+    def test_preferred_source_wins_regardless_of_insert_order(self):
+        for order in (("coingecko", "defillama"), ("defillama", "coingecko")):
+            with connect(":memory:") as c:
+                create_price_tables(c)
+                for source in order:
+                    price = 99.0 if source == "coingecko" else 8.80
+                    _insert_price(c, ts=H0, price_usd=price, source=source)
+                cache = _load_price_cache(c)
+                assert cache[("ethereum", UNI, H0)] == 8.80
+
+    def test_collision_is_logged(self, caplog):
+        with connect(":memory:") as c:
+            create_price_tables(c)
+            _insert_price(c, ts=H0, price_usd=8.80, source="defillama")
+            _insert_price(c, ts=H0, price_usd=99.0, source="coingecko")
+            with caplog.at_level(logging.INFO):
+                _load_price_cache(c)
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "more than one source" in combined
+
+    def test_one_key_per_hour_after_resolution(self):
+        with connect(":memory:") as c:
+            create_price_tables(c)
+            _insert_price(c, ts=H0, price_usd=8.80, source="defillama")
+            _insert_price(c, ts=H0, price_usd=99.0, source="coingecko")
+            assert len(_load_price_cache(c)) == 1
+
+    def test_unlisted_source_is_used_when_it_is_the_only_one(self):
+        """Deprioritised, not discarded — a lone CoinGecko row still prices the hour."""
+        with connect(":memory:") as c:
+            create_price_tables(c)
+            _insert_price(c, ts=H0, price_usd=99.0, source="coingecko")
+            assert _load_price_cache(c)[("ethereum", UNI, H0)] == 99.0
+
+    def test_no_collision_log_when_sources_are_unique(self, price_cache_db, caplog):
+        with caplog.at_level(logging.INFO):
+            _load_price_cache(price_cache_db)
+        combined = "\n".join(r.getMessage() for r in caplog.records)
+        assert "more than one source" not in combined
+
+
+class TestLookupPrice:
+    def test_exact_hour_match(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "ethereum", UNI, H1) == 8.85
+
+    def test_mid_hour_event_truncates_down(self, price_cache_db):
+        """A 01:47 event prices at the 01:00 row — truncation, not rounding."""
+        cache = _load_price_cache(price_cache_db)
+        event = H1 + timedelta(minutes=47, seconds=19)
+        assert _lookup_price(cache, "ethereum", UNI, event) == 8.85
+
+    def test_last_second_of_an_hour_still_truncates_down(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        event = H1 + timedelta(minutes=59, seconds=59, microseconds=999999)
+        assert _lookup_price(cache, "ethereum", UNI, event) == 8.85
+
+    def test_missing_hour_returns_none(self, price_cache_db):
+        """The MKR-grid case: a real answer, not an error (ADR 0012 decision 6)."""
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "ethereum", AAVE, H2 + timedelta(hours=5)) is None
+
+    def test_hour_inside_the_range_but_absent_returns_none(self, price_cache_db):
+        """AAVE has H0, H1 and H2 but nothing later; UNI has no H3 either."""
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "ethereum", UNI, H2 + timedelta(hours=1)) is None
+
+    def test_unknown_token_returns_none(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "ethereum", "0x" + "9" * 40, H0) is None
+
+    def test_wrong_chain_returns_none(self, price_cache_db):
+        """AAVE is priced on Ethereum only in this fixture."""
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "base", AAVE, H0) is None
+
+    def test_chain_scoping_picks_the_right_price(self, price_cache_db):
+        """UNI is priced on both chains at H0, at different prices."""
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "ethereum", UNI, H0) == 8.80
+        assert _lookup_price(cache, "base", UNI, H0) == 8.81
+
+    def test_token_address_is_case_insensitive(self, price_cache_db):
+        cache = _load_price_cache(price_cache_db)
+        assert _lookup_price(cache, "ethereum", UNI.upper(), H0) == 8.80
+
+    def test_non_utc_event_timestamp_truncates_on_the_utc_grid(self, price_cache_db):
+        """A +05:30 timestamp must land on the UTC hour, not the local one.
+
+        The same hazard ADR 0009's UTC session pin addressed in SQL, here in
+        Python: 01:47Z rendered as 07:17+05:30 truncates to 07:00 locally, which
+        is 01:30Z — an hour no price row can ever have.
+        """
+        from zoneinfo import ZoneInfo
+
+        cache = _load_price_cache(price_cache_db)
+        event = (H1 + timedelta(minutes=47)).astimezone(ZoneInfo("Asia/Kolkata"))
+        assert _lookup_price(cache, "ethereum", UNI, event) == 8.85
+
+    def test_empty_cache_returns_none(self):
+        assert _lookup_price({}, "ethereum", UNI, H0) is None
