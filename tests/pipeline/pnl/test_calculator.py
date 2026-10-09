@@ -2947,3 +2947,151 @@ class TestSwapStreamMerge:
             ]
 
         assert snapshot() == snapshot()
+
+
+# ---------- Contract-mediated attribution (ADR 0016) ----------
+
+
+class TestContractMediatedAttribution:
+    """ADR 0016: a partition that traded a token but never held it is a signing
+    EOA, not the holder, and is flagged rather than ranked.
+
+    The flag is asserted on the emitted WalletPnL rows rather than on
+    PartitionState, because the row is what a leaderboard reads — a flag that
+    never reaches the column would be indistinguishable from the dormant False
+    this ADR replaces.
+    """
+
+    def _rows(self, db):
+        return list(compute_wallet_pnl(db, as_of=H2, wallet_filter=[WALLET]))
+
+    def test_swap_only_partition_flips_smart_wallet_signal(self, replay_db):
+        """Swaps where tx_from is the wallet, and no transfer rows at all.
+
+        This is the live shape found by ADR 0012 step 6: an arb bot's signing
+        EOA, whose UNI moves between the pool and a custody contract and never
+        touches the signer's balance.
+        """
+        _insert_price(replay_db, ts=H0, price_usd=2000.0, token_address=WETH)
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        # Buy UNI, then sell it: a self-contained round trip with no transfers.
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            amount0=-500 * WEI,
+            amount1=15 * 10**17,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(2),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-16 * 10**17,
+        )
+
+        rows = self._rows(replay_db)
+        uni = [r for r in rows if r.token_address == UNI]
+        assert uni, "expected a UNI partition from the swaps alone"
+        assert all(r.has_smart_wallet_signal for r in uni)
+
+    def test_transfer_only_partition_does_not_flip_signal(self, replay_db):
+        """A wallet that holds and moves the token is the holder by definition."""
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="sell",
+            block_timestamp=H1,
+            block_number=2,
+            qty=100 * WEI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+
+        rows = self._rows(replay_db)
+        uni = [r for r in rows if r.token_address == UNI]
+        assert uni, "expected a UNI partition from the transfers alone"
+        assert not any(r.has_smart_wallet_signal for r in uni)
+
+    def test_mixed_partition_does_not_flip_signal(self, replay_db):
+        """One transfer is enough to establish custody.
+
+        The threshold is deliberately a single event rather than a ratio: a
+        wallet that has ever received or sent the token demonstrably holds it,
+        and ADR 0016's signal is the *total absence* of custody evidence, not
+        its scarcity.
+        """
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=OTHER,
+            to_addr=WALLET,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-15 * 10**17,
+        )
+
+        rows = self._rows(replay_db)
+        uni = [r for r in rows if r.token_address == UNI]
+        assert uni
+        assert not any(r.has_smart_wallet_signal for r in uni)
+
+    def test_swap_only_wallet_still_reconciles_internally(self, replay_db):
+        """ADR 0016 changes the subject, not the arithmetic.
+
+        The flagged row's PnL must still equal the sum of its realizations —
+        this is the property the step-6 spot-check verified and which, on its
+        own, could not detect the wrong subject.
+        """
+        _insert_price(replay_db, ts=H0, price_usd=2000.0, token_address=WETH)
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H0,
+            block_number=1,
+            log_index=0,
+            amount0=-500 * WEI,
+            amount1=15 * 10**17,
+        )
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(2),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=500 * WEI,
+            amount1=-16 * 10**17,
+        )
+
+        partitions = _process_events(replay_db, as_of=H2, wallet_filter=[WALLET])
+        state = partitions[_key(WALLET, UNI)]
+        assert state.has_smart_wallet_signal
+        assert state.transfer_event_count == 0
+        assert state.swap_event_count == 2
+
+        uni = next(r for r in self._rows(replay_db) if r.token_address == UNI)
+        expected = sum(r.pnl_usd for r in state.realizations)
+        assert uni.realized_pnl_usd == pytest.approx(expected)

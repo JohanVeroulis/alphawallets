@@ -418,6 +418,16 @@ class PartitionState:
     insufficient_balance_count: int = 0
     event_count: int = 0
 
+    transfer_event_count: int = 0
+    """Events applied from erc20_transfer."""
+
+    swap_event_count: int = 0
+    """Events applied from uniswap_v3_swap.
+
+    Counted separately from transfers rather than inferred from event_count
+    because ADR 0016's signal is precisely the ratio between the two, and a
+    single total cannot express "traded this token but never held it"."""
+
     in_events: list[LotEvent] = field(default_factory=list)
     """Every acquisition applied to this partition, in chronological order.
 
@@ -440,6 +450,35 @@ class PartitionState:
 
     Transfer-OUT to anything else contributes nothing, by decision 3. Step D
     slices this list by realized_at to produce per-window PnL (decision 9)."""
+
+    @property
+    def has_smart_wallet_signal(self) -> bool:
+        """True when this partition traded the token but never held it.
+
+        ADR 0016. Zero events from `erc20_transfer` and at least one from
+        `uniswap_v3_swap` means the wallet appears only as a swap's `tx_from` —
+        it signed the transactions, but the token never entered or left its
+        balance. For contract-mediated trading (arb bots, MEV searchers,
+        aggregator executors) the custody address is the contract, not the
+        signer, so the PnL is arithmetically correct for the wrong subject.
+
+        Derived rather than assigned, for the same reason `has_pre_window_activity`
+        is: the merge is streaming, so a partition is only "finished" once every
+        event has been read, and a flag set mid-replay could be set from an
+        incomplete picture. Reading it at emission time means one definition
+        evaluated against the final counters.
+
+        Example:
+            >>> from alphawallets.pipeline.pnl.cost_basis import FIFOEngine
+            >>> s = PartitionState(engine=FIFOEngine("0xabc", "0xdef", 18))
+            >>> s.swap_event_count = 3
+            >>> s.has_smart_wallet_signal
+            True
+            >>> s.transfer_event_count = 1
+            >>> s.has_smart_wallet_signal
+            False
+        """
+        return self.transfer_event_count == 0 and self.swap_event_count > 0
 
 
 def _merge_sort_key(event: ERC20Transfer | UniswapV3Swap) -> tuple:
@@ -696,6 +735,7 @@ def _process_events(
                 )
 
             state.event_count += 1
+            state.transfer_event_count += 1
             if state.first_event_at is None:
                 # Events arrive chronologically (PR #35), so the first one seen
                 # is the earliest — no min() needed, and relying on the order
@@ -1026,9 +1066,9 @@ def _emit_pnl_rows(
             avg_cost_basis_usd=avg_cost,
             has_pre_window_activity=has_pre_window,
             has_unpriceable_events=unpriced_in_window,
-            # Decision 7: detection logic is V1.5+. False rather than None so
-            # the column is honest about what V1 checked, which is nothing.
-            has_smart_wallet_signal=False,
+            # ADR 0016 activates decision 7's flag: a partition that traded
+            # the token but never held it is a signing EOA, not the holder.
+            has_smart_wallet_signal=state.has_smart_wallet_signal,
             computed_at=computed_at,
         )
 
@@ -1244,9 +1284,10 @@ def _apply_swap(
     happened in. The sold side consumes from its FIFO stack and keeps the
     Realizations; the bought side opens a lot.
 
-    The wallet is `tx_from` — the submitting EOA, per ADR 0012 decision 7, which
-    computes per-EOA and flags suspected smart-wallet mediation rather than
-    attempting to resolve it.
+    The wallet is `tx_from` — the transaction *signer*, which for
+    contract-mediated trading is not the token holder. V1 computes per-signer
+    and flags the partition (ADR 0016) rather than resolving custody, which
+    needs the transfer legs dedup drops plus a refetch for contract addresses.
     """
     wallet = swap.tx_from
     if allowed is not None and wallet not in allowed:
@@ -1276,6 +1317,7 @@ def _apply_swap(
     )
     for state in (sold_state, bought_state):
         state.event_count += 1
+        state.swap_event_count += 1
         if state.first_event_at is None:
             state.first_event_at = swap.block_timestamp
 
