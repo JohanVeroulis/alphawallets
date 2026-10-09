@@ -136,29 +136,38 @@ def _print_summary(rows: list[WalletPnL], *, written: int, dry_run: bool) -> Non
         count = sum(1 for r in rows if predicate(r))
         share = 100.0 * count / len(rows)
         print(f"    {label:<26} {count:>5} / {len(rows)} rows ({share:5.1f}%)")
-    print("    (pre-window rows are excluded from leaderboard rankings per ADR 0012 decision 5)")
+    print(
+        "    (pre-window rows are excluded from leaderboard rankings per ADR 0012 "
+        "decision 5;\n     contract-mediated rows likewise per ADR 0016)"
+    )
 
     shortest = min(WINDOW_DAYS)
-    ranked = sorted(
-        (r for r in rows if (r.window_end - r.window_start).days == shortest),
-        key=lambda r: r.realized_pnl_trading_usd,
-        reverse=True,
-    )[:TOP_WALLETS]
+    in_window = [r for r in rows if (r.window_end - r.window_start).days == shortest]
+    # Both exclusions applied here, not just reported above. This top-N is the
+    # only leaderboard the project has today, so printing a flagged row inside
+    # it would contradict the two ADRs the lines above cite — and ADR 0016 was
+    # written because a flagged row sat at the top of exactly this list.
+    eligible = [
+        r for r in in_window if not r.has_pre_window_activity and not r.has_smart_wallet_signal
+    ]
+    ranked = sorted(eligible, key=lambda r: r.realized_pnl_trading_usd, reverse=True)[:TOP_WALLETS]
+    excluded = len(in_window) - len(eligible)
     if ranked:
-        print(f"\n  Top {len(ranked)} by trading PnL ({shortest}d window):")
+        print(f"\n  Top {len(ranked)} eligible by trading PnL ({shortest}d window):")
         for row in ranked:
-            flags = "".join(
-                [
-                    "P" if row.has_pre_window_activity else "-",
-                    "U" if row.has_unpriceable_events else "-",
-                ]
-            )
+            flags = "U" if row.has_unpriceable_events else "-"
             print(
                 f"    {row.wallet[:10]}… {row.token_address[:10]}… "
                 f"trading ${row.realized_pnl_trading_usd:>14,.2f}  "
                 f"airdrop ${row.realized_pnl_airdrop_usd:>14,.2f}  [{flags}]"
             )
-        print("    flags: P = pre-window activity, U = unpriceable events")
+        print("    flags: U = unpriceable events")
+    else:
+        print(f"\n  No eligible rows to rank in the {shortest}d window.")
+    print(
+        f"    {excluded} of {len(in_window)} {shortest}d rows excluded from ranking "
+        "(pre-window or contract-mediated)"
+    )
 
     if dry_run:
         print(f"\n  Dry run — nothing written. First {SAMPLE_ROWS} rows:")

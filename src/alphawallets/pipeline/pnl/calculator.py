@@ -418,6 +418,16 @@ class PartitionState:
     insufficient_balance_count: int = 0
     event_count: int = 0
 
+    transfer_event_count: int = 0
+    """Events applied from erc20_transfer."""
+
+    swap_event_count: int = 0
+    """Events applied from uniswap_v3_swap.
+
+    Counted separately from transfers rather than inferred from event_count
+    because ADR 0016's signal is precisely the ratio between the two, and a
+    single total cannot express "traded this token but never held it"."""
+
     in_events: list[LotEvent] = field(default_factory=list)
     """Every acquisition applied to this partition, in chronological order.
 
@@ -440,6 +450,41 @@ class PartitionState:
 
     Transfer-OUT to anything else contributes nothing, by decision 3. Step D
     slices this list by realized_at to produce per-window PnL (decision 9)."""
+
+    had_deduped_transfer: bool = False
+    """A transfer row for this partition existed but was removed by ADR 0015's
+    dedup. Still custody evidence, so it suppresses ADR 0016's flag."""
+
+    @property
+    def has_smart_wallet_signal(self) -> bool:
+        """True when this partition traded the token but never held it.
+
+        ADR 0016. Zero events from `erc20_transfer` and at least one from
+        `uniswap_v3_swap` means the wallet appears only as a swap's `tx_from` —
+        it signed the transactions, but the token never entered or left its
+        balance. For contract-mediated trading (arb bots, MEV searchers,
+        aggregator executors) the custody address is the contract, not the
+        signer, so the PnL is arithmetically correct for the wrong subject.
+
+        Derived rather than assigned, for the same reason `has_pre_window_activity`
+        is: the merge is streaming, so a partition is only "finished" once every
+        event has been read, and a flag set mid-replay could be set from an
+        incomplete picture. Reading it at emission time means one definition
+        evaluated against the final counters.
+
+        Example:
+            >>> from alphawallets.pipeline.pnl.cost_basis import FIFOEngine
+            >>> s = PartitionState(engine=FIFOEngine("0xabc", "0xdef", 18))
+            >>> s.swap_event_count = 3
+            >>> s.has_smart_wallet_signal
+            True
+            >>> s.transfer_event_count = 1
+            >>> s.has_smart_wallet_signal
+            False
+        """
+        if self.transfer_event_count or self.had_deduped_transfer:
+            return False
+        return self.swap_event_count > 0
 
 
 def _merge_sort_key(event: ERC20Transfer | UniswapV3Swap) -> tuple:
@@ -607,7 +652,10 @@ def _process_events(
     # magnitude smaller than the transfer table, so this is cheap.
     swaps = list(_fetch_swap_events(conn, chains=chains))
     dedup_set = _build_swap_dedup_set(swaps)
-    transfers = _filter_transfers_by_dedup(_fetch_transfer_events(conn, chains=chains), dedup_set)
+    custody_seen: set[PartitionKey] = set()
+    transfers = _filter_transfers_by_dedup(
+        _fetch_transfer_events(conn, chains=chains), dedup_set, custody_seen
+    )
 
     # heapq.merge over two already-sorted streams, rather than sorting their
     # concatenation: both readers emit in order, so the merge is linear and the
@@ -696,6 +744,7 @@ def _process_events(
                 )
 
             state.event_count += 1
+            state.transfer_event_count += 1
             if state.first_event_at is None:
                 # Events arrive chronologically (PR #35), so the first one seen
                 # is the earliest — no min() needed, and relying on the order
@@ -822,13 +871,25 @@ def _process_events(
     if decimals_conflicts:
         logger.warning("%d token_decimals conflict(s) across the replay", decimals_conflicts)
 
+    # Applied after the merge rather than during it: custody_seen is filled by
+    # the transfer generator as it is consumed, so it is only complete once the
+    # stream is exhausted. A partition created by a swap before its deduped
+    # transfer leg was reached would otherwise miss the evidence.
+    for key in custody_seen:
+        state = partitions.get(key)
+        if state is not None:
+            state.had_deduped_transfer = True
+
     flagged_unpriced = sum(1 for s in partitions.values() if s.has_unpriceable_events)
     flagged_balance = sum(1 for s in partitions.values() if s.has_insufficient_balance)
+    flagged_smart = sum(1 for s in partitions.values() if s.has_smart_wallet_signal)
     logger.info(
-        "Replayed into %d partition(s): %d with unpriced events, %d with insufficient balance",
+        "Replayed into %d partition(s): %d with unpriced events, %d with "
+        "insufficient balance, %d contract-mediated (ADR 0016)",
         len(partitions),
         flagged_unpriced,
         flagged_balance,
+        flagged_smart,
     )
     return partitions
 
@@ -1026,9 +1087,9 @@ def _emit_pnl_rows(
             avg_cost_basis_usd=avg_cost,
             has_pre_window_activity=has_pre_window,
             has_unpriceable_events=unpriced_in_window,
-            # Decision 7: detection logic is V1.5+. False rather than None so
-            # the column is honest about what V1 checked, which is nothing.
-            has_smart_wallet_signal=False,
+            # ADR 0016 activates decision 7's flag: a partition that traded
+            # the token but never held it is a signing EOA, not the holder.
+            has_smart_wallet_signal=state.has_smart_wallet_signal,
             computed_at=computed_at,
         )
 
@@ -1200,12 +1261,17 @@ def _build_swap_dedup_set(swaps: Iterable[UniswapV3Swap]) -> set[DedupKey]:
 def _filter_transfers_by_dedup(
     transfers: Iterable[ERC20Transfer],
     dedup_set: set[DedupKey],
+    custody_seen: set[PartitionKey] | None = None,
 ) -> Iterator[ERC20Transfer]:
     """Yield transfers that a swap row does not already account for.
 
     Args:
         transfers: The transfer event stream, in chronological order.
         dedup_set: From _build_swap_dedup_set.
+        custody_seen: Optional set, populated with the (chain, wallet, token)
+            of every party to a *dropped* transfer. ADR 0016 needs to know a
+            transfer row existed even when dedup removed it; None skips the
+            bookkeeping for callers that do not.
 
     Yields:
         Transfers whose (tx_hash, token_address) is not in the set, in the order
@@ -1217,6 +1283,15 @@ def _filter_transfers_by_dedup(
     for transfer in transfers:
         if (transfer.tx_hash, transfer.token_address) in dedup_set:
             dropped += 1
+            if custody_seen is not None:
+                # A dropped leg is still proof the wallet held the token, which
+                # ADR 0016's flag turns on. Recorded before discarding, because
+                # otherwise a wallet whose only transfers were swap legs looks
+                # like it never took custody — it is the commonest shape for a
+                # wallet that buys through a router, and flagging it would be a
+                # false positive on the one signal the flag exists to carry.
+                custody_seen.add((transfer.chain, transfer.from_addr, transfer.token_address))
+                custody_seen.add((transfer.chain, transfer.to_addr, transfer.token_address))
             continue
         kept += 1
         yield transfer
@@ -1244,9 +1319,10 @@ def _apply_swap(
     happened in. The sold side consumes from its FIFO stack and keeps the
     Realizations; the bought side opens a lot.
 
-    The wallet is `tx_from` — the submitting EOA, per ADR 0012 decision 7, which
-    computes per-EOA and flags suspected smart-wallet mediation rather than
-    attempting to resolve it.
+    The wallet is `tx_from` — the transaction *signer*, which for
+    contract-mediated trading is not the token holder. V1 computes per-signer
+    and flags the partition (ADR 0016) rather than resolving custody, which
+    needs the transfer legs dedup drops plus a refetch for contract addresses.
     """
     wallet = swap.tx_from
     if allowed is not None and wallet not in allowed:
@@ -1276,6 +1352,7 @@ def _apply_swap(
     )
     for state in (sold_state, bought_state):
         state.event_count += 1
+        state.swap_event_count += 1
         if state.first_event_at is None:
             state.first_event_at = swap.block_timestamp
 

@@ -29,7 +29,7 @@ No join is needed, because every field the calculator wants is already on the sw
 
 | Field | Role |
 |---|---|
-| `tx_from` | The trader EOA — the partition's wallet (PR #15's enrichment) |
+| `tx_from` | The transaction signer EOA (PR #15's enrichment). For contract-mediated trading this is distinct from the token holder; such partitions are flagged `has_smart_wallet_signal = True` per [ADR 0016](0016-contract-mediated-attribution.md) |
 | `amount0`, `amount1` | The **executed** amounts, signed from the pool's perspective |
 | `pool_address` | Resolves the token layout and which amount is the tracked token |
 | `block_timestamp` | Event ordering and the window the realization falls in |
