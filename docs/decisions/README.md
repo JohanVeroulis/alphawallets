@@ -35,3 +35,4 @@ This folder records significant decisions: what we chose, why, and what we gave 
 | 0013 | *Reserved* — provider grid granularity (proposed in PR #31, not yet written) | Proposed |
 | [0014](0014-pool-destination-realization.md) | Transfer-OUT to a Uniswap V3 pool is a realization | Accepted |
 | [0015](0015-per-swap-executed-price.md) | Per-swap executed price, from swaps as an event source | Accepted |
+| [0016](0016-contract-mediated-attribution.md) | Contract-mediated trading is flagged, not ranked | Accepted |
