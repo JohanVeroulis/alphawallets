@@ -236,3 +236,62 @@ class TestCliErrors:
         err = capsys.readouterr().err
         assert "SchemaDriftError" in err
         assert "does not migrate" in err
+
+
+class TestRankingExclusions:
+    """The top-N print is the only leaderboard the project has, so the two
+    exclusions it cites must actually be applied to it (ADR 0012 decision 5,
+    ADR 0016). A flagged row sitting at the top of this list is what prompted
+    ADR 0016 in the first place."""
+
+    def _summary(self, capsys, rows):
+        from alphawallets.pipeline.pnl.__main__ import _print_summary
+
+        _print_summary(rows, written=len(rows), dry_run=False)
+        return capsys.readouterr().out
+
+    def _row(self, **over):
+        from alphawallets.pipeline.pnl.models import WalletPnL
+
+        base = dict(
+            chain="ethereum",
+            wallet=WALLET,
+            token_address=UNI,
+            window_start=H0 - timedelta(days=30),
+            window_end=H0,
+            realized_pnl_usd=100.0,
+            realized_pnl_trading_usd=100.0,
+            realized_pnl_airdrop_usd=0.0,
+            unrealized_pnl_usd=None,
+            bought_usd=500.0,
+            sold_usd=600.0,
+            realization_count=3,
+            balance_token=0,
+            avg_cost_basis_usd=None,
+            has_pre_window_activity=False,
+            has_unpriceable_events=False,
+            has_smart_wallet_signal=False,
+            computed_at=H0,
+        )
+        base.update(over)
+        return WalletPnL(**base)
+
+    def test_contract_mediated_row_is_not_ranked(self, capsys):
+        flagged = self._row(
+            wallet=OTHER, realized_pnl_trading_usd=9999.0, has_smart_wallet_signal=True
+        )
+        out = self._summary(capsys, [flagged, self._row()])
+        assert "9,999.00" not in out
+        assert "100.00" in out
+        assert "1 of 2 30d rows excluded" in out
+
+    def test_pre_window_row_is_not_ranked(self, capsys):
+        flagged = self._row(
+            wallet=OTHER, realized_pnl_trading_usd=9999.0, has_pre_window_activity=True
+        )
+        out = self._summary(capsys, [flagged, self._row()])
+        assert "9,999.00" not in out
+
+    def test_all_rows_excluded_says_so_rather_than_printing_nothing(self, capsys):
+        out = self._summary(capsys, [self._row(has_smart_wallet_signal=True)])
+        assert "No eligible rows to rank" in out
