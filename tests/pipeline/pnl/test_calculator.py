@@ -92,15 +92,20 @@ def _insert_qty(
     to_addr: str = WALLET,
     token_address: str = UNI,
     chain: str = "ethereum",
+    tx_hash: str = "0x" + "a" * 64,
 ) -> None:
-    """Like _insert but with an explicit quantity, for PnL arithmetic tests."""
+    """Like _insert but with an explicit quantity, for PnL arithmetic tests.
+
+    tx_hash is overridable so a test can put a transfer in the same transaction
+    as a swap, which is what ADR 0015's dedup keys on.
+    """
     conn.execute(
         "INSERT INTO erc20_transfer VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             chain,
             block_number,
             block_timestamp,
-            "0x" + "a" * 64,
+            tx_hash,
             0,
             unique_id,
             token_address,
@@ -3095,3 +3100,47 @@ class TestContractMediatedAttribution:
         uni = next(r for r in self._rows(replay_db) if r.token_address == UNI)
         expected = sum(r.pnl_usd for r in state.realizations)
         assert uni.realized_pnl_usd == pytest.approx(expected)
+
+    def test_deduped_transfer_leg_still_counts_as_custody(self, replay_db):
+        """A swap leg removed by ADR 0015's dedup is still custody evidence.
+
+        Measured on the live cache: 113 partitions had a transfer-IN whose
+        transaction also held a swap, so the dedup dropped it and the partition
+        looked custody-less. Those wallets demonstrably held the token, which
+        makes the flag a false positive — ADR 0016's definition is "zero rows in
+        erc20_transfer", not "zero events the engine applied".
+        """
+        _insert_price(replay_db, ts=H1, price_usd=2000.0, token_address=WETH)
+        # A buy, so the partition opens a lot and emits a row: a sell with no
+        # prior acquisition raises insufficient balance and emits nothing,
+        # which would make the row assertion below vacuous.
+        _insert_swap(
+            replay_db,
+            unique_tx=_tx(1),
+            block_timestamp=H1,
+            block_number=2,
+            log_index=0,
+            amount0=-500 * WEI,
+            amount1=15 * 10**17,
+        )
+        # The swap's own UNI leg: same tx_hash, so dedup drops it from the
+        # stream. It still proves the wallet took delivery of the token.
+        _insert_qty(
+            replay_db,
+            unique_id="leg",
+            block_timestamp=H1,
+            block_number=2,
+            qty=500 * WEI,
+            from_addr=UNI_WETH_POOL,
+            to_addr=WALLET,
+            tx_hash=_tx(1),
+        )
+
+        partitions = _process_events(replay_db, as_of=H2, wallet_filter=[WALLET])
+        state = partitions[_key(WALLET, UNI)]
+        assert state.transfer_event_count == 0, "the leg should have been deduped out"
+        assert state.had_deduped_transfer, "but its custody evidence should survive"
+        assert not state.has_smart_wallet_signal
+
+        uni = next(r for r in self._rows(replay_db) if r.token_address == UNI)
+        assert not uni.has_smart_wallet_signal
