@@ -25,6 +25,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from duckdb import CatalogException, DuckDBPyConnection
@@ -39,6 +40,7 @@ from alphawallets.pipeline.pnl.transfer_treatment import (
     TransferTreatment,
     classify_transfer,
 )
+from alphawallets.seeds import is_seeded
 from alphawallets.tokens import V1_TOKENS
 
 logger = logging.getLogger(__name__)
@@ -927,6 +929,8 @@ def compute_wallet_pnl(
     as_of: datetime | None = None,
     wallet_filter: list[str] | None = None,
     chains: list[Chain] | None = None,
+    seeded_only: bool = False,
+    seed_path: Path | None = None,
 ) -> Iterator[WalletPnL]:
     """Compute per-(wallet, token, window) PnL rows from the cache.
 
@@ -943,10 +947,21 @@ def compute_wallet_pnl(
             make the result depend on when it was run.
         wallet_filter: Only compute these wallets, any case.
         chains: Restrict to these chains. None means every chain; [] means none.
+        seeded_only: Yield only rows whose (chain, wallet) is in the ADR 0017
+            seed registry. Default False, which yields everything — the write
+            path depends on that, because ADR 0017 keeps the cache complete and
+            excludes non-seeded wallets from *ranking* rather than from storage.
+            Pass True only for a report whose audience is the ranked universe.
+        seed_path: Registry override, for tests.
 
     Yields:
         One WalletPnL per (partition, window) that had activity in that window.
         Nothing at all when the cache holds no transfers.
+
+        The seed filter is **additional** to the caveat flags, never a
+        replacement: a seeded wallet carrying has_pre_window_activity (ADR 0012
+        decision 5) or has_smart_wallet_signal (ADR 0016) is still excluded by
+        those, which are applied at ranking time by the consumer.
 
     Notes:
         A generator. The writer consumes incrementally, and a universe-wide run
@@ -964,12 +979,25 @@ def compute_wallet_pnl(
     partitions = _process_events(conn, chains=chains, wallet_filter=wallet_filter, as_of=as_of)
 
     emitted = 0
+    suppressed = 0
     for key, state in sorted(partitions.items()):
+        if seeded_only and not is_seeded(key[0], key[1], seed_path):
+            suppressed += 1
+            continue
         for row in _emit_pnl_rows(key, state, as_of):
             emitted += 1
             yield row
 
-    logger.info("Emitted %d WalletPnL row(s) from %d partition(s)", emitted, len(partitions))
+    if seeded_only:
+        logger.info(
+            "Emitted %d WalletPnL row(s); %d of %d partition(s) suppressed as non-seeded "
+            "(ADR 0017)",
+            emitted,
+            suppressed,
+            len(partitions),
+        )
+    else:
+        logger.info("Emitted %d WalletPnL row(s) from %d partition(s)", emitted, len(partitions))
 
 
 def _resolve_as_of(
