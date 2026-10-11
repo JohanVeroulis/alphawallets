@@ -3144,3 +3144,131 @@ class TestContractMediatedAttribution:
 
         uni = next(r for r in self._rows(replay_db) if r.token_address == UNI)
         assert not uni.has_smart_wallet_signal
+
+
+# ---------- Seed-registry eligibility filter (ADR 0017) ----------
+
+
+class TestSeededOnlyFilter:
+    """ADR 0017: the seed registry narrows the ranked universe, and is an
+    additional exclusion on top of ADR 0012 decision 5 and ADR 0016 — never a
+    replacement for either."""
+
+    @pytest.fixture
+    def seed_file(self, tmp_path):
+        """A registry holding WALLET on ethereum only. OTHER is unseeded, and
+        WALLET on base is unseeded, so one fixture covers both misses."""
+        import json
+
+        from alphawallets.seeds import load_seed_registry
+
+        path = tmp_path / "seeds.json"
+        path.write_text(
+            json.dumps(
+                [
+                    {
+                        "address": WALLET.upper().replace("0X", "0x"),
+                        "chain": "ethereum",
+                        "source": "test-fixture",
+                        "label": "seeded wallet",
+                        "snapshot_date": "2026-10-11",
+                    },
+                    {
+                        "address": THIRD,
+                        "chain": "ethereum",
+                        "source": "test-fixture",
+                        "label": "seeded but inactive",
+                        "snapshot_date": "2026-10-11",
+                    },
+                ]
+            )
+        )
+        load_seed_registry.cache_clear()
+        yield path
+        load_seed_registry.cache_clear()
+
+    def _two_wallets(self, db):
+        """One acquisition for WALLET and one for OTHER, both priced."""
+        _insert_qty(
+            db,
+            unique_id="seeded",
+            block_timestamp=H0,
+            block_number=1,
+            qty=500 * WEI,
+            from_addr=THIRD,
+            to_addr=WALLET,
+        )
+        _insert_qty(
+            db,
+            unique_id="unseeded",
+            block_timestamp=H0,
+            block_number=2,
+            qty=500 * WEI,
+            from_addr=THIRD,
+            to_addr=OTHER,
+        )
+
+    def test_seeded_only_filters_correctly(self, replay_db, seed_file):
+        self._two_wallets(replay_db)
+        rows = list(
+            compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file)
+        )
+        assert rows, "the seeded wallet should still produce rows"
+        assert {r.wallet for r in rows} == {WALLET}
+
+    def test_seeded_only_default_off_is_backward_compat(self, replay_db, seed_file):
+        """Default False is load-bearing: the write path relies on it, because
+        ADR 0017 keeps the cache complete."""
+        self._two_wallets(replay_db)
+        default = list(compute_wallet_pnl(replay_db, as_of=H2))
+        explicit = list(compute_wallet_pnl(replay_db, as_of=H2, seeded_only=False))
+        assert {r.wallet for r in default} >= {WALLET, OTHER}
+        assert [r.model_dump(exclude={"computed_at"}) for r in default] == [
+            r.model_dump(exclude={"computed_at"}) for r in explicit
+        ]
+
+    def test_seed_filter_stacks_with_other_flags(self, replay_db, seed_file):
+        """A seeded wallet that trips ADR 0012 decision 5 is still excluded.
+
+        The filter runs at emission, the caveat flags at ranking, so the row
+        must come back seeded *and* flagged — proving the two exclusions are
+        independent rather than one overriding the other.
+        """
+        # A sale with no prior acquisition raises insufficient balance, which is
+        # ADR 0012 decision 5's second has_pre_window_activity signal.
+        _insert_qty(
+            replay_db,
+            unique_id="naked-sell",
+            block_timestamp=H1,
+            block_number=2,
+            qty=500 * WEI,
+            from_addr=WALLET,
+            to_addr=UNI_WETH_POOL,
+        )
+        _insert_qty(
+            replay_db,
+            unique_id="buy",
+            block_timestamp=H0,
+            block_number=1,
+            qty=1 * WEI,
+            from_addr=THIRD,
+            to_addr=WALLET,
+        )
+        rows = list(
+            compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file)
+        )
+        uni = [r for r in rows if r.token_address == UNI and r.wallet == WALLET]
+        assert uni, "seeded wallet is emitted by the seed filter"
+        assert all(r.has_pre_window_activity for r in uni), (
+            "and is still flagged, so ranking excludes it independently"
+        )
+
+    def test_seeded_but_inactive_wallet_yields_nothing(self, replay_db, seed_file):
+        """THIRD is in the registry but only ever a counterparty, so it has no
+        partition of its own. A seed is an eligibility filter, not a guarantee
+        the wallet appears."""
+        self._two_wallets(replay_db)
+        rows = list(
+            compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file)
+        )
+        assert THIRD not in {r.wallet for r in rows}

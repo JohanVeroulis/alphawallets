@@ -142,6 +142,12 @@ uv run python -m alphawallets.pipeline.exploration.wallet_activity_proof
 uv run python -m alphawallets.pipeline.pnl
 uv run python -m alphawallets.pipeline.pnl --dry-run
 uv run python -m alphawallets.pipeline.pnl --wallet 0xABC... --chains ethereum
+
+# ...or rank only the ADR 0017 seed universe. Rows for non-seeded wallets are
+# still computed and still written — only the leaderboard narrows.
+# Registry: src/alphawallets/seeds/smart_money.json (placeholder data for now;
+# see src/alphawallets/seeds/README.md)
+uv run python -m alphawallets.pipeline.pnl --dry-run --seeded-only
 ```
 
 **Note on dependencies:** `pyproject.toml` declares `duckdb`, `pandas`, `python-dotenv`, `httpx`, `web3` (pinned to 7.x per [ADR 0005](docs/decisions/0005-web3-7x-pin.md)), `eth-abi` (5.x), and `pydantic` (2.x). Dev dependencies: `ruff`, `pytest`, `pytest-cov`, `ipykernel`.

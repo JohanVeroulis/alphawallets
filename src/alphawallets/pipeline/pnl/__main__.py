@@ -25,6 +25,7 @@ from alphawallets.db import connect
 from alphawallets.pipeline.pnl.calculator import WINDOW_DAYS, compute_wallet_pnl
 from alphawallets.pipeline.pnl.models import WalletPnL
 from alphawallets.pipeline.pnl.writer import create_tables, write_wallet_pnl
+from alphawallets.seeds import is_seeded, load_seed_registry
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Compute and report without writing. Prints counts and a sample.",
     )
     parser.add_argument(
+        "--seeded-only",
+        action="store_true",
+        help=(
+            "Rank only wallets in the ADR 0017 seed registry. Rows for "
+            "non-seeded wallets are still computed and still written — the "
+            "cache stays complete; only the leaderboard narrows."
+        ),
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -108,8 +118,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_summary(rows: list[WalletPnL], *, written: int, dry_run: bool) -> None:
-    """Report what the run produced, including how much of it carries caveats."""
+def _print_summary(
+    rows: list[WalletPnL], *, written: int, dry_run: bool, seeded_only: bool = False
+) -> None:
+    """Report what the run produced, including how much of it carries caveats.
+
+    `seeded_only` narrows the *ranking*, not the row set. ADR 0017 keeps the
+    cache complete deliberately — the filter belongs here, at the point where
+    eligibility is already decided, next to the two caveat exclusions.
+    """
     print("\nAlphaWallets — PnL Calculator")
     if not rows:
         print("  No PnL rows produced.")
@@ -123,6 +140,8 @@ def _print_summary(rows: list[WalletPnL], *, written: int, dry_run: bool) -> Non
     partitions = {(r.chain, r.wallet, r.token_address) for r in rows}
     verdict = "computed, not written" if dry_run else f"{written} written"
     print(f"  Rows:       {len(rows)} ({verdict})")
+    if seeded_only:
+        print("  Ranking:    seeded universe only (--seeded-only); all rows still written")
     print(f"  Partitions: {len(partitions)} (chain, wallet, token)")
     print(f"  Windows:    {', '.join(f'{d}d' for d in WINDOW_DAYS)}")
     print(f"  As of:      {rows[0].window_end.isoformat()}")
@@ -150,6 +169,16 @@ def _print_summary(rows: list[WalletPnL], *, written: int, dry_run: bool) -> Non
     eligible = [
         r for r in in_window if not r.has_pre_window_activity and not r.has_smart_wallet_signal
     ]
+    if seeded_only:
+        # Applied after the caveat exclusions, not instead of them: a seeded
+        # wallet carrying either flag stays excluded (ADR 0017).
+        before_seed = len(eligible)
+        eligible = [r for r in eligible if is_seeded(r.chain, r.wallet)]
+        print(
+            f"\n  Seed registry (ADR 0017): {len(load_seed_registry())} address(es); "
+            f"{before_seed - len(eligible)} of {before_seed} otherwise-eligible rows "
+            "are not in the ranked universe"
+        )
     ranked = sorted(eligible, key=lambda r: r.realized_pnl_trading_usd, reverse=True)[:TOP_WALLETS]
     excluded = len(in_window) - len(eligible)
     if ranked:
@@ -228,7 +257,7 @@ def main() -> int:
         print(f"{type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
-    _print_summary(rows, written=written, dry_run=args.dry_run)
+    _print_summary(rows, written=written, dry_run=args.dry_run, seeded_only=args.seeded_only)
     return 0
 
 
