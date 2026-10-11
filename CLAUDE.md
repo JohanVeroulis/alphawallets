@@ -269,6 +269,8 @@ The remaining zero-PnL rows are **79% Base**. The fix was not a code change: 15 
 
 **Base needs volume before it needs alignment.** Its swap table holds 10 rows against 173,991 transfers. Aligning its windows was costed at 44,734 `eth_getLogs` windows (~104 min, ~3.4M CU) and rejected on that ratio: the chain needs a broader initial backfill first.
 
+**The wallet universe is the wrong population, and that is now a decision rather than an observation.** 96.2% of the 18,939 thirty-day partitions (18,223) realize *nothing* in the window; only 0.5% clear ten trades. ADR 0016's exclusion left one wallet that is both profitable and over the provisional >=10-trade bar. [ADR 0017](docs/decisions/0017-smart-money-seeding.md) replaces the indiscriminate universe with a curated seed registry; until it is implemented, every leaderboard figure is a measurement of the wrong population and should be read that way. **Legal diligence is owed before the frontend ships** (Week 5+): the public labels get attributed on a Methodology page, and V1 must state plainly that it is a Smart-Money-seeded profitability tracker rather than a universal wallet analyzer.
+
 **Open: provider grid granularity.** MKR's historical data is on a 4-hour grid, so events in the other three hours of each block classify as `unavailable` and print a "re-run AW_03" remedy that cannot help. Same error shape ADR 0010 prevents, one level down. Proposed as ADR 0013 — likely a bounded nearest-prior lookup plus a distinct off-grid state.
 
 ### Decided
@@ -289,7 +291,7 @@ The remaining zero-PnL rows are **79% Base**. The fix was not a code change: 15 
 
 - [~] **Category rules:** a wallet can belong to multiple categories, with a primary + secondary designation.
 
-- [~] **Wallet-universe seed strategy:** bootstrap from ~500 recent large swaps (>$100k) on Uniswap V3 top pools + known whale lists from public sources (DeBank leaderboards, Arkham labels) + top airdrop recipients who sold $100k+. Expand organically via counterparty analysis in V1.5.
+- [x] **Wallet-universe seed strategy:** decided in [ADR 0017](docs/decisions/0017-smart-money-seeding.md) — a hand-curated seed registry committed to the repo (`src/alphawallets/seeds/smart_money.json`), from Nansen Smart Money labels, Arkham entity labels, DeBank whale leaderboards and large-swap originators, with provenance per entry. Target ~500-1,000 addresses. **AW_01 and AW_02 fetchers remain universe-agnostic. Seed registry is a calculator-level filter per ADR 0017** — it applies alongside the ADR 0012 decision 5 and ADR 0016 exclusions, so a non-seeded wallet's row is still computed and written, just not ranked. The full cache therefore stays available for the V1.5 custody work, and a registry refresh is a recompute rather than a backfill. **Refreshed monthly for V1**, by hand rather than automatically: an automatic refresh would change the ranked population underneath a comparison without anyone noticing. Two constraints the ADR records and the implementation must respect — the large-swap source cannot seed `tx_from` (91% of >=$100k originators are addresses ADR 0016 flags as contract-mediated), and seeding is justified by signal quality rather than cost, since AW_01 cannot filter by wallet server-side and AW_02's Transfers API filter is per-address rather than per-list. Expand organically via counterparty analysis in V1.5.
 
 ### Open
 
