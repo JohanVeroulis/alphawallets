@@ -3210,9 +3210,7 @@ class TestSeededOnlyFilter:
 
     def test_seeded_only_filters_correctly(self, replay_db, seed_file):
         self._two_wallets(replay_db)
-        rows = list(
-            compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file)
-        )
+        rows = list(compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file))
         assert rows, "the seeded wallet should still produce rows"
         assert {r.wallet for r in rows} == {WALLET}
 
@@ -3254,9 +3252,7 @@ class TestSeededOnlyFilter:
             from_addr=THIRD,
             to_addr=WALLET,
         )
-        rows = list(
-            compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file)
-        )
+        rows = list(compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file))
         uni = [r for r in rows if r.token_address == UNI and r.wallet == WALLET]
         assert uni, "seeded wallet is emitted by the seed filter"
         assert all(r.has_pre_window_activity for r in uni), (
@@ -3268,7 +3264,5 @@ class TestSeededOnlyFilter:
         partition of its own. A seed is an eligibility filter, not a guarantee
         the wallet appears."""
         self._two_wallets(replay_db)
-        rows = list(
-            compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file)
-        )
+        rows = list(compute_wallet_pnl(replay_db, as_of=H2, seeded_only=True, seed_path=seed_file))
         assert THIRD not in {r.wallet for r in rows}

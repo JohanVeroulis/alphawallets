@@ -193,10 +193,12 @@ def _print_summary(
         print("    flags: U = unpriceable events")
     else:
         print(f"\n  No eligible rows to rank in the {shortest}d window.")
-    print(
-        f"    {excluded} of {len(in_window)} {shortest}d rows excluded from ranking "
-        "(pre-window or contract-mediated)"
-    )
+    reasons = "pre-window or contract-mediated"
+    if seeded_only:
+        # Naming only the caveat flags here would misattribute a seed-filter
+        # exclusion to them, which is wrong whenever the registry is narrow.
+        reasons += ", or not in the seed registry"
+    print(f"    {excluded} of {len(in_window)} {shortest}d rows excluded from ranking ({reasons})")
 
     if dry_run:
         print(f"\n  Dry run — nothing written. First {SAMPLE_ROWS} rows:")
