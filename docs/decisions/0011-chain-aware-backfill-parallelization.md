@@ -97,6 +97,45 @@ A follow-up PR, in this order:
 6. Structured progress events for observability.
 7. Live verification — a parallel 1-day backfill measured against the serial baselines from PR #25 (AW_02: 18/18 pairs, 142,210 transfers, 1,149s) and PR #28, reporting wall-clock improvement per chain rather than in aggregate, since the whole point is that the two chains behave differently.
 
+## Amendment, 2026-10-12 — the 18× is AW_01-only, and AW_02's real cost is per-row
+
+A 30-day Ethereum backfill measured two things this ADR had estimated, and one
+of them reverses a natural reading of it.
+
+**The ~18× Base multiplier applies to `eth_getLogs` (AW_01), not to AW_02.** It
+comes from Base's 2s blocks against ADR 0006's 10-block cap, so it scales with
+*blocks*. AW_02 uses the Transfers API, which has no block cap, so its cost
+scales with *transfer count* — and Base's density is lower than Ethereum's:
+
+| | transfers/block | 30-day span | projected AW_02 cost |
+|---|---|---|---|
+| Ethereum (AAVE, measured) | 1.587 | 216,000 blocks | 61.5 min, one token |
+| Base (6 tokens, observed) | 0.575 | 1,296,000 blocks | **~2.2 h, all six** |
+
+Applying the 18× to AW_02 yields a figure around 200 hours, which is wrong by
+roughly 90×. The multiplier is a property of the request-per-block ceiling, and
+it must not be carried across to a fetcher that does not have one.
+
+**AW_02's bottleneck is CPU, not network.** Measured on Ethereum AAVE, 30 days:
+
+```
+pages_fetched 343   transfers_seen 342,869   written 330,039   elapsed 3,692s
+→ 10.8 s/page, 92.9 transfers/sec, 82% CPU, 100 MB RSS, 1 open connection
+```
+
+82% CPU with a single connection is not IO-bound waiting. The cost is per-row
+work — model validation and inserts — so a page-rate model built from latency
+underestimates badly: a 3.4 s/page estimate predicted 4.5 minutes against 61.5
+measured, 13× low, from two compounding errors (4.3× more transfers than the
+density model, and 3× slower pages).
+
+Two consequences for the implementation plan above. Step 7's verification should
+report **CPU saturation per worker**, not only wall clock, because a CPU-bound
+inner loop does not parallelise the way a latency-bound one does — concurrency
+across pairs may buy far less than the per-chain request budgets suggest. And a
+full 12-token 30-day Ethereum backfill is ~12 hours serial, which makes
+concurrency load-bearing for V1 rather than an optimisation.
+
 ## References
 
 - **PR #25** (`feat/multi-token-expansion`) — the AW_02 pagination latency measurements and the 57%-in-11% concentration finding.
