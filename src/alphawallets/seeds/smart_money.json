@@ -1,86 +1,114 @@
 [
   {
-    "address": "0x278d858f05b94576c1e6f73285886876ff6ef8d2",
+    "address": "0x7bfee91193d9df2ac0bfe90191d40f23c773c060",
+    "chain": "ethereum",
+    "source": "debank-web3-social-ranking",
+    "label": "an0n",
+    "snapshot_date": "2026-10-12"
+  },
+  {
+    "address": "0x7bfee91193d9df2ac0bfe90191d40f23c773c060",
     "chain": "base",
-    "source": "placeholder-local-cache",
-    "label": "high-frequency MORPHO trader (3,363 realizations, +$314.67)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "an0n",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x5b43453fce04b92e190f391a83136bfbecedefd1",
+    "address": "0xbdfa4f4492dd7b7cf211209c4791af8d52bf5c50",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "arb/MEV signer, 1,121 swaps across 12 pools; contract-mediated per ADR 0016",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "Ethereum",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0xbdb3ba9ffe392549e1f8658dd2630c141fdf47b6",
+    "address": "0x33eecc48943aaeabb5328a25ff28eb85f67945c2",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "custody contract for 0x5b43453f; verified on-chain 2026-10-09 (11,703 bytes)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "33EE",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x6420a51576732468eff4daffdb168f573cd2b2df",
+    "address": "0x5c9e30def85334e587cf36eb07bdd6a72bf1452d",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "top clean UNI trader (+$67.90 over 2 realizations)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "TradFiWhale",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x2c5549067a5617c1cef354d5b96b0940dcfc867a",
+    "address": "0xd92293daca6bbed57f8cb6d498b48ea93e035e99",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "splits sales across fee tiers; ADR 0014 gap wallet from the step-6 spot-check",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "4What",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x6fda6f746366b66a1aedd4fae34cba12c217ca9a",
+    "address": "0xd6cb7a7b544e24e5160a948a16c45b1096276f9d",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "clean ETHFI trader (+$13.72)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "Tson",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0xdde06e9cc710c4f9ec2b838463cc550a7027f713",
+    "address": "0x41bc7d0687e6cea57fa26da78379dfdc5627c56d",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "clean ETHFI trader (+$8.08 over 5 realizations)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "just_a_guy",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x5fc04a1f6dbed0cd0ae5519957980771410c2b72",
+    "address": "0x011b0a055e02425461a1ae95b30f483c4ff05be7",
+    "chain": "ethereum",
+    "source": "debank-web3-social-ranking",
+    "label": "cucbku",
+    "snapshot_date": "2026-10-12"
+  },
+  {
+    "address": "0x011b0a055e02425461a1ae95b30f483c4ff05be7",
     "chain": "base",
-    "source": "placeholder-local-cache",
-    "label": "clean UNI trader on Base (+$5.28 over 5 realizations)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "cucbku",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x8bc0a810bac571d5fd9fb16a692b7df5062b0c35",
-    "chain": "base",
-    "source": "placeholder-local-cache",
-    "label": "clean UNI trader on Base (+$4.14 over 7 realizations)",
-    "snapshot_date": "2026-10-11"
-  },
-  {
-    "address": "0x5f5457685151b87cd029430a3f2508d528535e89",
+    "address": "0xbbbc35dfac3a00a03a8fde3540eca4f0e15c5e64",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "only wallet both profitable and over the 10-trade bar (LINK, 20 realizations)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "0xbbbc",
+    "snapshot_date": "2026-10-12"
   },
   {
-    "address": "0x51c72848c68a965f66fa7a88855f9f7784502a7f",
-    "chain": "base",
-    "source": "placeholder-local-cache",
-    "label": "high-volume Base router/aggregator counterparty (264 realizations)",
-    "snapshot_date": "2026-10-11"
-  },
-  {
-    "address": "0xe8eb46fb40d096316124cf82089df5c2d7b82398",
+    "address": "0x47441bd9fb3441370cb5b6c4684a0104353aec66",
     "chain": "ethereum",
-    "source": "placeholder-local-cache",
-    "label": "profitable contract-mediated signer (+$168.55 over 164 realizations)",
-    "snapshot_date": "2026-10-11"
+    "source": "debank-web3-social-ranking",
+    "label": "Powerstake",
+    "snapshot_date": "2026-10-12"
+  },
+  {
+    "address": "0xa3df90bf8e8183a74b537b27e3955ba7d8de199c",
+    "chain": "ethereum",
+    "source": "debank-web3-social-ranking",
+    "label": "Mesut",
+    "snapshot_date": "2026-10-12"
+  },
+  {
+    "address": "0xa3df90bf8e8183a74b537b27e3955ba7d8de199c",
+    "chain": "base",
+    "source": "debank-web3-social-ranking",
+    "label": "Mesut",
+    "snapshot_date": "2026-10-12"
+  },
+  {
+    "address": "0xb72ed8401892466ea8af528c1af1d0524bc5e105",
+    "chain": "ethereum",
+    "source": "debank-web3-social-ranking",
+    "label": "Gekko",
+    "snapshot_date": "2026-10-12"
+  },
+  {
+    "address": "0xb72ed8401892466ea8af528c1af1d0524bc5e105",
+    "chain": "base",
+    "source": "debank-web3-social-ranking",
+    "label": "Gekko",
+    "snapshot_date": "2026-10-12"
   }
 ]

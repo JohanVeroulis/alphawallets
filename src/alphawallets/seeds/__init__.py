@@ -23,7 +23,7 @@ changes silently between runs cannot be compared with itself.
 
 Example:
     >>> registry = load_seed_registry()
-    >>> is_seeded("ethereum", "0x6420A51576732468eFf4dAffdb168F573cd2b2df")
+    >>> is_seeded("ethereum", "0x33EeCc48943aAEaBb5328A25fF28eb85f67945c2")
     True
 """
 

@@ -94,23 +94,52 @@ class TestLoader:
             load_seed_registry(path)
 
 
+# Sources the registry is allowed to cite. A curated entry must name a
+# dashboard somebody actually read, so an unrecognised value fails the suite
+# rather than entering the file unnoticed — provenance nobody can check is the
+# one failure mode seeds/README.md says destroys the schema's purpose.
+KNOWN_SOURCES = frozenset(
+    {
+        "debank-web3-social-ranking",
+        "nansen-smart-money",
+        "arkham-public",
+    }
+)
+
+
 class TestCommittedRegistry:
-    """The shipped file is placeholder data, but it must still be loadable and
-    honestly labelled — a registry whose provenance cannot be trusted is worse
-    than no registry (see seeds/README.md)."""
+    """The shipped file is real curated data (ADR 0017). It must load, carry
+    checkable provenance, and stay inside V1 scope — a registry whose
+    provenance cannot be trusted is worse than no registry."""
 
     def test_committed_file_loads(self):
         registry = load_seed_registry()
         assert registry, "the committed registry should not be empty"
         assert all(addr == addr.lower() for _, addr in registry)
 
-    def test_every_entry_is_marked_placeholder(self):
+    def test_every_entry_cites_a_known_source(self):
         entries = json.loads(SEED_FILE.read_text())
-        assert all(e["source"].startswith("placeholder-") for e in entries), (
-            "Bootstrap entries must be greppable as placeholders so the real "
-            "curation can replace them without guessing which is which."
+        unknown = {e["source"] for e in entries} - KNOWN_SOURCES
+        assert not unknown, (
+            f"Unrecognised seed source(s): {sorted(unknown)}. Add the dashboard "
+            "to KNOWN_SOURCES deliberately, so a typo or an invented source "
+            "cannot enter the registry unnoticed."
         )
+
+    def test_no_placeholder_entries_remain(self):
+        """The bootstrap registry from PR #51 has been fully replaced."""
+        entries = json.loads(SEED_FILE.read_text())
+        assert not [e for e in entries if e["source"].startswith("placeholder")]
 
     def test_chains_are_in_v1_scope(self):
         entries = json.loads(SEED_FILE.read_text())
         assert {e["chain"] for e in entries} <= {"ethereum", "base"}
+
+    def test_address_and_chain_pairs_are_unique(self):
+        """A duplicated (address, chain) would load as one key and silently
+        reduce the registry below the entry count, making a curation mistake
+        invisible."""
+        entries = json.loads(SEED_FILE.read_text())
+        pairs = [(e["address"].lower(), e["chain"]) for e in entries]
+        assert len(pairs) == len(set(pairs))
+        assert len(load_seed_registry()) == len(entries)
